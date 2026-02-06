@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
+import { useDropzone, FileRejection } from "react-dropzone";
 import {
   Card,
   CardContent,
@@ -52,6 +53,12 @@ import {
   SlidersHorizontal,
   Database,
   ChevronDown,
+  Book,
+  FileText,
+  File,
+  AlertCircle,
+  Eye,
+  X,
 } from "lucide-react";
 
 const STORAGE_KEY = "agent-config-state";
@@ -60,6 +67,32 @@ interface MetadataEntry {
   id: string;
   key: string;
   value: string;
+}
+
+interface UploadedFile {
+  id: string;
+  filename: string;
+  size: number;
+  status: "pending" | "uploading" | "completed" | "error";
+  progress?: number;
+  error?: string;
+  content?: string;
+  mime_type: string;
+}
+
+interface KnowledgeBaseFile {
+  file_id: string;
+  filename: string;
+  uploaded_at: string;
+  size_bytes: number;
+  vector_store_id: string;
+}
+
+interface KnowledgeBaseConfig {
+  files: KnowledgeBaseFile[];
+  total_files: number;
+  total_size_bytes: number;
+  last_updated: string;
 }
 
 interface AgentConfigState {
@@ -81,6 +114,9 @@ interface AgentConfigState {
   // Business Logic
   webhookUrl: string;
   metadata: MetadataEntry[];
+  // Knowledge Base
+  vectorStoreIds: string[] | null;
+  knowledgeBaseConfig: KnowledgeBaseConfig | null;
 }
 
 const defaultState: AgentConfigState = {
@@ -98,6 +134,8 @@ const defaultState: AgentConfigState = {
   maxOutputTokens: "",
   webhookUrl: "",
   metadata: [],
+  vectorStoreIds: null,
+  knowledgeBaseConfig: null,
 };
 
 const templates: Record<string, Partial<AgentConfigState>> = {
@@ -210,6 +248,9 @@ export function AgentConfig() {
     statusText: string;
     body: string;
   } | null>(null);
+  // Knowledge Base state
+  const [uploadQueue, setUploadQueue] = useState<UploadedFile[]>([]);
+  const [isUploadingToVectorStore, setIsUploadingToVectorStore] = useState(false);
   const { toast } = useToast(); // Use the toast function from useToast hook
 
   // Load from localStorage on mount
@@ -258,10 +299,10 @@ export function AgentConfig() {
     []
   );
 
-const resetForm = useCallback(() => {
-  setState(defaultState);
-  localStorage.removeItem(STORAGE_KEY);
-  toast({ title: "Form reset to defaults" });
+  const resetForm = useCallback(() => {
+    setState(defaultState);
+    localStorage.removeItem(STORAGE_KEY);
+    toast({ title: "Form reset to defaults" });
   }, []);
 
   const loadTemplate = useCallback((templateKey: string) => {
@@ -306,6 +347,226 @@ const resetForm = useCallback(() => {
     },
     []
   );
+
+  // ============ Knowledge Base Functions ============
+
+  // Format file size for display
+  const formatFileSize = useCallback((bytes: number): string => {
+    if (bytes === 0) return "0 B";
+    const k = 1024;
+    const sizes = ["B", "KB", "MB", "GB"];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return `${(bytes / Math.pow(k, i)).toFixed(1)} ${sizes[i]}`;
+  }, []);
+
+  // Format date for display
+  const formatDate = useCallback((isoString: string): string => {
+    return new Date(isoString).toLocaleDateString("pt-BR", {
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+    });
+  }, []);
+
+  // Get icon based on file type
+  const getFileIcon = useCallback((mimeType: string) => {
+    if (mimeType === "application/pdf") {
+      return <FileText className="w-5 h-5 text-red-500" />;
+    }
+    if (mimeType === "text/plain") {
+      return <FileText className="w-5 h-5 text-blue-500" />;
+    }
+    if (mimeType.includes("wordprocessing")) {
+      return <FileText className="w-5 h-5 text-blue-600" />;
+    }
+    if (mimeType === "text/markdown") {
+      return <FileText className="w-5 h-5 text-gray-600" />;
+    }
+    return <File className="w-5 h-5" />;
+  }, []);
+
+  // Convert file to base64
+  const fileToBase64 = useCallback((file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.readAsDataURL(file);
+      reader.onload = () => {
+        const base64 = reader.result as string;
+        const base64Content = base64.split(",")[1];
+        resolve(base64Content);
+      };
+      reader.onerror = reject;
+    });
+  }, []);
+
+  // Handle file drop
+  const handleFileDrop = useCallback(
+    async (acceptedFiles: File[]) => {
+      const existingCount = uploadQueue.length + (state.knowledgeBaseConfig?.total_files || 0);
+      if (existingCount + acceptedFiles.length > 20) {
+        toast({
+          title: "Limite excedido",
+          description: "Máximo de 20 arquivos por agente",
+          variant: "destructive",
+        });
+        return;
+      }
+
+      const newFiles: UploadedFile[] = acceptedFiles.map((file) => ({
+        id: crypto.randomUUID(),
+        filename: file.name,
+        size: file.size,
+        mime_type: file.type || "application/octet-stream",
+        status: "pending" as const,
+        progress: 0,
+      }));
+
+      setUploadQueue((prev) => [...prev, ...newFiles]);
+
+      // Convert to base64
+      for (let i = 0; i < newFiles.length; i++) {
+        const fileInfo = newFiles[i];
+        const originalFile = acceptedFiles[i];
+        try {
+          const base64Content = await fileToBase64(originalFile);
+          setUploadQueue((prev) =>
+            prev.map((f) =>
+              f.id === fileInfo.id
+                ? { ...f, content: base64Content, status: "completed" as const, progress: 100 }
+                : f
+            )
+          );
+        } catch {
+          setUploadQueue((prev) =>
+            prev.map((f) =>
+              f.id === fileInfo.id
+                ? { ...f, status: "error" as const, error: "Erro ao processar arquivo" }
+                : f
+            )
+          );
+        }
+      }
+    },
+    [uploadQueue.length, state.knowledgeBaseConfig?.total_files, fileToBase64, toast]
+  );
+
+  // Handle rejected files
+  const handleDropRejected = useCallback(
+    (rejectedFiles: FileRejection[]) => {
+      rejectedFiles.forEach((rejection) => {
+        const errors = rejection.errors.map((e) => {
+          if (e.code === "file-too-large") {
+            return `${rejection.file.name}: Arquivo muito grande (máx 50MB)`;
+          }
+          if (e.code === "file-invalid-type") {
+            return `${rejection.file.name}: Formato não suportado. Use PDF, TXT, DOCX ou MD`;
+          }
+          return e.message;
+        });
+
+        toast({
+          title: "Erro ao adicionar arquivo",
+          description: errors.join(", "),
+          variant: "destructive",
+        });
+      });
+    },
+    [toast]
+  );
+
+  // Remove file from queue
+  const removeFileFromQueue = useCallback((fileId: string) => {
+    setUploadQueue((prev) => prev.filter((f) => f.id !== fileId));
+  }, []);
+
+  // Upload files to vector store
+  const uploadFilesToVectorStore = useCallback(async () => {
+    const filesToUpload = uploadQueue.filter((f) => f.status === "completed" && f.content);
+    if (filesToUpload.length === 0) {
+      toast({
+        title: "Nenhum arquivo para enviar",
+        description: "Adicione arquivos antes de fazer upload",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    setIsUploadingToVectorStore(true);
+    try {
+      const payload = {
+        agent_id: state.name || "new-agent",
+        action: "upload_files",
+        files: filesToUpload.map((f) => ({
+          filename: f.filename,
+          content: f.content,
+          mime_type: f.mime_type,
+        })),
+      };
+
+      const response = await fetch(
+        "https://automacao.7club.com.br/webhook/vector-store-upload",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        }
+      );
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error(errorData.error || `Erro ${response.status}`);
+      }
+
+      const result = await response.json();
+
+      // Update state with vector store info
+      if (result.vector_store_id) {
+        updateState({
+          vectorStoreIds: [result.vector_store_id],
+          knowledgeBaseConfig: {
+            files: filesToUpload.map((f) => ({
+              file_id: crypto.randomUUID(),
+              filename: f.filename,
+              uploaded_at: new Date().toISOString(),
+              size_bytes: f.size,
+              vector_store_id: result.vector_store_id,
+            })),
+            total_files: result.files_processed || filesToUpload.length,
+            total_size_bytes: result.total_size_bytes || filesToUpload.reduce((acc, f) => acc + f.size, 0),
+            last_updated: new Date().toISOString(),
+          },
+        });
+      }
+
+      setUploadQueue([]);
+      toast({
+        title: "Upload concluído!",
+        description: `${filesToUpload.length} arquivo(s) adicionado(s) à knowledge base`,
+      });
+    } catch (error) {
+      toast({
+        title: "Erro no upload",
+        description: error instanceof Error ? error.message : "Erro desconhecido",
+        variant: "destructive",
+      });
+    } finally {
+      setIsUploadingToVectorStore(false);
+    }
+  }, [uploadQueue, state.name, updateState, toast]);
+
+  // Dropzone configuration
+  const { getRootProps, getInputProps, isDragActive } = useDropzone({
+    accept: {
+      "application/pdf": [".pdf"],
+      "text/plain": [".txt"],
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document": [".docx"],
+      "text/markdown": [".md"],
+    },
+    maxSize: 50 * 1024 * 1024,
+    maxFiles: 20,
+    onDrop: handleFileDrop,
+    onDropRejected: handleDropRejected,
+  });
 
   const isReasoningModel = state.model.startsWith("o1") || state.model.startsWith("o3");
 
@@ -450,7 +711,7 @@ const resetForm = useCallback(() => {
         statusText: "Network Error",
         body: error instanceof Error ? error.message : "Unknown error",
       });
-      toast({ 
+      toast({
         title: `Network error: ${error instanceof Error ? error.message : "Unknown error"}`,
         variant: "destructive"
       });
@@ -518,7 +779,7 @@ const resetForm = useCallback(() => {
           <Card>
             <CardContent className="pt-6">
               <Tabs defaultValue="identity" className="w-full">
-                <TabsList className="grid w-full grid-cols-4 mb-6">
+                <TabsList className="grid w-full grid-cols-5 mb-6">
                   <TabsTrigger value="identity" className="flex items-center gap-2">
                     <Bot className="h-4 w-4" />
                     <span className="hidden sm:inline">Identity</span>
@@ -534,6 +795,10 @@ const resetForm = useCallback(() => {
                   <TabsTrigger value="business" className="flex items-center gap-2">
                     <Database className="h-4 w-4" />
                     <span className="hidden sm:inline">Business</span>
+                  </TabsTrigger>
+                  <TabsTrigger value="knowledge-base" className="flex items-center gap-2">
+                    <Book className="h-4 w-4" />
+                    <span className="hidden sm:inline">Knowledge</span>
                   </TabsTrigger>
                 </TabsList>
 
@@ -622,9 +887,8 @@ const resetForm = useCallback(() => {
                         placeholder={'[\n  {\n    "type": "function",\n    "function": { ... }\n  }\n]'}
                         value={state.tools}
                         onChange={(e) => updateState({ tools: e.target.value })}
-                        className={`min-h-[200px] resize-y font-mono text-sm ${
-                          toolsError ? "border-destructive" : ""
-                        }`}
+                        className={`min-h-[200px] resize-y font-mono text-sm ${toolsError ? "border-destructive" : ""
+                          }`}
                       />
                       {toolsError && (
                         <p className="text-sm text-destructive">{toolsError}</p>
@@ -839,6 +1103,194 @@ const resetForm = useCallback(() => {
                     </div>
                   </div>
                 </TabsContent>
+
+                {/* Knowledge Base Tab */}
+                <TabsContent value="knowledge-base" className="space-y-6">
+                  {/* Upload Section */}
+                  <Card className="p-6">
+                    <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
+                      <Upload className="h-5 w-5" />
+                      Upload de Arquivos
+                    </h3>
+
+                    <div
+                      {...getRootProps()}
+                      className={`border-2 border-dashed rounded-lg p-12 text-center cursor-pointer transition-colors ${isDragActive
+                          ? "border-primary bg-primary/5"
+                          : "border-muted-foreground/25 hover:border-primary/50"
+                        }`}
+                    >
+                      <input {...getInputProps()} />
+                      <Upload className="w-12 h-12 mx-auto mb-4 text-muted-foreground" />
+                      <p className="text-lg mb-2">
+                        {isDragActive
+                          ? "Solte os arquivos aqui..."
+                          : "Arraste arquivos aqui ou clique para selecionar"}
+                      </p>
+                      <p className="text-sm text-muted-foreground">
+                        Formatos aceitos: PDF, TXT, DOCX, MD • Tamanho máx: 50MB
+                      </p>
+                    </div>
+
+                    {/* Upload Queue */}
+                    {uploadQueue.length > 0 && (
+                      <div className="mt-4 space-y-2">
+                        {uploadQueue.map((file) => (
+                          <div
+                            key={file.id}
+                            className="flex items-center justify-between p-3 rounded-lg border bg-card"
+                          >
+                            <div className="flex items-center gap-3">
+                              {getFileIcon(file.mime_type)}
+                              <div>
+                                <p className="font-medium text-sm">{file.filename}</p>
+                                <p className="text-xs text-muted-foreground">
+                                  {formatFileSize(file.size)}
+                                </p>
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              {file.status === "pending" && (
+                                <Loader2 className="w-5 h-5 animate-spin text-muted-foreground" />
+                              )}
+                              {file.status === "completed" && (
+                                <Check className="w-5 h-5 text-green-500" />
+                              )}
+                              {file.status === "error" && (
+                                <AlertCircle className="w-5 h-5 text-red-500" />
+                              )}
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                onClick={() => removeFileFromQueue(file.id)}
+                                className="h-8 w-8"
+                              >
+                                <X className="w-4 h-4" />
+                              </Button>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    <Button
+                      className="mt-4 w-full"
+                      onClick={uploadFilesToVectorStore}
+                      disabled={isUploadingToVectorStore || uploadQueue.length === 0}
+                    >
+                      {isUploadingToVectorStore ? (
+                        <>
+                          <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                          Enviando...
+                        </>
+                      ) : (
+                        <>
+                          <Upload className="mr-2 h-4 w-4" />
+                          Upload para Vector Store
+                        </>
+                      )}
+                    </Button>
+                  </Card>
+
+                  {/* Current Knowledge Base Section */}
+                  <Card className="p-6">
+                    <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
+                      <Book className="h-5 w-5" />
+                      Knowledge Base Atual
+                    </h3>
+
+                    {!state.knowledgeBaseConfig || state.knowledgeBaseConfig.total_files === 0 ? (
+                      <div className="text-center py-12 bg-muted/50 rounded-lg">
+                        <Database className="w-12 h-12 mx-auto text-muted-foreground mb-4" />
+                        <h4 className="text-lg font-medium mb-2">
+                          Nenhum arquivo na knowledge base
+                        </h4>
+                        <p className="text-sm text-muted-foreground">
+                          Faça upload de arquivos para que o agente possa acessá-los
+                        </p>
+                      </div>
+                    ) : (
+                      <>
+                        {/* Statistics */}
+                        <div className="grid grid-cols-3 gap-4 p-4 bg-muted rounded-lg mb-4">
+                          <div>
+                            <p className="text-sm text-muted-foreground">Vector Store ID</p>
+                            <p className="font-mono text-sm truncate">
+                              {state.vectorStoreIds?.[0] || "N/A"}
+                            </p>
+                          </div>
+                          <div>
+                            <p className="text-sm text-muted-foreground">Total de arquivos</p>
+                            <p className="text-2xl font-bold">
+                              {state.knowledgeBaseConfig.total_files}
+                            </p>
+                          </div>
+                          <div>
+                            <p className="text-sm text-muted-foreground">Storage usado</p>
+                            <p className="text-2xl font-bold">
+                              {formatFileSize(state.knowledgeBaseConfig.total_size_bytes)}
+                            </p>
+                          </div>
+                        </div>
+
+                        {/* File List */}
+                        <div className="space-y-2">
+                          {state.knowledgeBaseConfig.files.map((file) => (
+                            <div
+                              key={file.file_id}
+                              className="flex items-center justify-between p-4 rounded-lg border"
+                            >
+                              <div className="flex items-center gap-3">
+                                <FileText className="w-8 h-8 text-blue-500" />
+                                <div>
+                                  <p className="font-medium">{file.filename}</p>
+                                  <p className="text-sm text-muted-foreground">
+                                    {formatFileSize(file.size_bytes)} •{" "}
+                                    {formatDate(file.uploaded_at)}
+                                  </p>
+                                </div>
+                              </div>
+                              <div className="flex gap-2">
+                                <Button variant="outline" size="sm">
+                                  <Eye className="w-4 h-4 mr-2" />
+                                  Ver
+                                </Button>
+                                <Button
+                                  variant="destructive"
+                                  size="sm"
+                                  onClick={() => {
+                                    // Remove file from KB
+                                    const newFiles = state.knowledgeBaseConfig!.files.filter(
+                                      (f) => f.file_id !== file.file_id
+                                    );
+                                    updateState({
+                                      knowledgeBaseConfig: {
+                                        ...state.knowledgeBaseConfig!,
+                                        files: newFiles,
+                                        total_files: newFiles.length,
+                                        total_size_bytes: newFiles.reduce(
+                                          (acc, f) => acc + f.size_bytes,
+                                          0
+                                        ),
+                                      },
+                                    });
+                                    toast({
+                                      title: "Arquivo removido",
+                                      description: `${file.filename} foi removido da knowledge base`,
+                                    });
+                                  }}
+                                >
+                                  <Trash2 className="w-4 h-4 mr-2" />
+                                  Remover
+                                </Button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </>
+                    )}
+                  </Card>
+                </TabsContent>
               </Tabs>
             </CardContent>
           </Card>
@@ -938,13 +1390,12 @@ const resetForm = useCallback(() => {
                   <div className="flex items-center justify-between">
                     <CardTitle className="text-lg">Response</CardTitle>
                     <span
-                      className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
-                        response.status >= 200 && response.status < 300
-                          ? "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200"
-                          : response.status === 0
-                            ? "bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200"
-                            : "bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200"
-                      }`}
+                      className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${response.status >= 200 && response.status < 300
+                        ? "bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200"
+                        : response.status === 0
+                          ? "bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200"
+                          : "bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200"
+                        }`}
                     >
                       {response.status === 0
                         ? "Network Error"
