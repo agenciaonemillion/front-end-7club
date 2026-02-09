@@ -113,6 +113,7 @@ interface AgentConfigState {
   maxOutputTokens: string;
   // Business Logic
   webhookUrl: string;
+  vectorStoreWebhookUrl: string;
   openaiApiKey: string;
   kommoAccountId: string;
   kommoSubdomain: string;
@@ -138,6 +139,7 @@ const defaultState: AgentConfigState = {
   reasoningEffort: "medium",
   maxOutputTokens: "",
   webhookUrl: "",
+  vectorStoreWebhookUrl: "https://automacao.7club.com.br/webhook/vector-store-upload",
   openaiApiKey: "",
   kommoAccountId: "",
   kommoSubdomain: "",
@@ -531,8 +533,9 @@ export function AgentConfig() {
         })),
       };
 
+      const webhookUrl = state.vectorStoreWebhookUrl || "https://automacao.7club.com.br/webhook/vector-store-upload";
       const response = await fetch(
-        "https://automacao.7club.com.br/webhook/vector-store-upload",
+        webhookUrl,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -580,7 +583,7 @@ export function AgentConfig() {
     } finally {
       setIsUploadingToVectorStore(false);
     }
-  }, [uploadQueue, state.agentId, state.openaiApiKey, updateState, toast]);
+  }, [uploadQueue, state.agentId, state.openaiApiKey, state.vectorStoreWebhookUrl, updateState, toast]);
 
   // Dropzone configuration
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
@@ -1082,6 +1085,21 @@ export function AgentConfig() {
                     </div>
 
                     <div className="space-y-2">
+                      <Label htmlFor="vectorStoreWebhookUrl">Vector Store Webhook URL</Label>
+                      <Input
+                        id="vectorStoreWebhookUrl"
+                        placeholder="https://automacao.7club.com.br/webhook/vector-store-upload"
+                        value={state.vectorStoreWebhookUrl}
+                        onChange={(e) =>
+                          updateState({ vectorStoreWebhookUrl: e.target.value })
+                        }
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        Webhook endpoint para upload de arquivos na vector store
+                      </p>
+                    </div>
+
+                    <div className="space-y-2">
                       <Label htmlFor="openaiApiKey">OpenAI API Key</Label>
                       <Input
                         id="openaiApiKey"
@@ -1094,6 +1112,21 @@ export function AgentConfig() {
                       />
                       <p className="text-xs text-muted-foreground">
                         Chave da API OpenAI para criação de vector stores
+                      </p>
+                    </div>
+
+                    <div className="space-y-2">
+                      <Label htmlFor="agentId">Agent UUID</Label>
+                      <Input
+                        id="agentId"
+                        placeholder="d2a65a3b-4785-42f7-b935-8ccbdc292d95"
+                        value={state.agentId}
+                        onChange={(e) =>
+                          updateState({ agentId: e.target.value })
+                        }
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        UUID do agente no Supabase (preenchido automaticamente ao salvar, ou cole manualmente)
                       </p>
                     </div>
 
@@ -1124,13 +1157,6 @@ export function AgentConfig() {
                         </p>
                       </div>
                     </div>
-
-                    {state.agentId && (
-                      <div className="rounded-lg border p-4 bg-muted/50">
-                        <Label className="text-sm text-muted-foreground">Agent UUID</Label>
-                        <p className="font-mono text-sm mt-1">{state.agentId}</p>
-                      </div>
-                    )}
 
                     <div className="space-y-4">
                       <div className="flex items-center justify-between">
