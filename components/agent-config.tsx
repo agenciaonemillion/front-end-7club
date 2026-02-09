@@ -113,10 +113,15 @@ interface AgentConfigState {
   maxOutputTokens: string;
   // Business Logic
   webhookUrl: string;
+  openaiApiKey: string;
+  kommoAccountId: string;
+  kommoSubdomain: string;
   metadata: MetadataEntry[];
   // Knowledge Base
   vectorStoreIds: string[] | null;
   knowledgeBaseConfig: KnowledgeBaseConfig | null;
+  // Agent UUID (set after creation)
+  agentId: string;
 }
 
 const defaultState: AgentConfigState = {
@@ -133,9 +138,13 @@ const defaultState: AgentConfigState = {
   reasoningEffort: "medium",
   maxOutputTokens: "",
   webhookUrl: "",
+  openaiApiKey: "",
+  kommoAccountId: "",
+  kommoSubdomain: "",
   metadata: [],
   vectorStoreIds: null,
   knowledgeBaseConfig: null,
+  agentId: "",
 };
 
 const templates: Record<string, Partial<AgentConfigState>> = {
@@ -491,11 +500,30 @@ export function AgentConfig() {
       return;
     }
 
+    if (!state.agentId) {
+      toast({
+        title: "Agente não criado",
+        description: "Salve a configuração do agente antes de fazer upload de arquivos",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    if (!state.openaiApiKey) {
+      toast({
+        title: "API Key não informada",
+        description: "Informe a OpenAI API Key na aba Business antes de fazer upload",
+        variant: "destructive",
+      });
+      return;
+    }
+
     setIsUploadingToVectorStore(true);
     try {
       const payload = {
-        agent_id: state.name || "new-agent",
+        agent_id: state.agentId,
         action: "upload_files",
+        openai_api_key: state.openaiApiKey,
         files: filesToUpload.map((f) => ({
           filename: f.filename,
           content: f.content,
@@ -552,7 +580,7 @@ export function AgentConfig() {
     } finally {
       setIsUploadingToVectorStore(false);
     }
-  }, [uploadQueue, state.name, updateState, toast]);
+  }, [uploadQueue, state.agentId, state.openaiApiKey, updateState, toast]);
 
   // Dropzone configuration
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
@@ -605,7 +633,10 @@ export function AgentConfig() {
           ? parseInt(state.maxOutputTokens, 10)
           : undefined,
         metadata: metadataObj,
+        openai_api_key: state.openaiApiKey,
       },
+      kommo_account_id: state.kommoAccountId,
+      kommo_subdomain: state.kommoSubdomain,
     };
 
     return cleanPayload(rawPayload) as typeof rawPayload;
@@ -701,6 +732,15 @@ export function AgentConfig() {
       });
 
       if (res.ok) {
+        // Extract agent_id UUID from response if available
+        try {
+          const parsed = JSON.parse(responseBody);
+          if (parsed.agent_id) {
+            updateState({ agentId: parsed.agent_id });
+          }
+        } catch {
+          // Response wasn't JSON, skip UUID extraction
+        }
         toast({ title: `Agent saved successfully (${res.status})` });
       } else {
         toast({ title: `Failed to save: ${res.status} ${res.statusText}`, variant: "destructive" });
@@ -1040,6 +1080,57 @@ export function AgentConfig() {
                         Webhook endpoint to save agent configuration
                       </p>
                     </div>
+
+                    <div className="space-y-2">
+                      <Label htmlFor="openaiApiKey">OpenAI API Key</Label>
+                      <Input
+                        id="openaiApiKey"
+                        type="password"
+                        placeholder="sk-..."
+                        value={state.openaiApiKey}
+                        onChange={(e) =>
+                          updateState({ openaiApiKey: e.target.value })
+                        }
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        Chave da API OpenAI para criação de vector stores
+                      </p>
+                    </div>
+
+                    <div className="grid sm:grid-cols-2 gap-4">
+                      <div className="space-y-2">
+                        <Label htmlFor="kommoAccountId">Kommo Account ID</Label>
+                        <Input
+                          id="kommoAccountId"
+                          placeholder="12345678"
+                          value={state.kommoAccountId}
+                          onChange={(e) =>
+                            updateState({ kommoAccountId: e.target.value })
+                          }
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <Label htmlFor="kommoSubdomain">Kommo Subdomain</Label>
+                        <Input
+                          id="kommoSubdomain"
+                          placeholder="your-company"
+                          value={state.kommoSubdomain}
+                          onChange={(e) =>
+                            updateState({ kommoSubdomain: e.target.value })
+                          }
+                        />
+                        <p className="text-xs text-muted-foreground">
+                          Subdomínio do Kommo (ex: your-company.kommo.com)
+                        </p>
+                      </div>
+                    </div>
+
+                    {state.agentId && (
+                      <div className="rounded-lg border p-4 bg-muted/50">
+                        <Label className="text-sm text-muted-foreground">Agent UUID</Label>
+                        <p className="font-mono text-sm mt-1">{state.agentId}</p>
+                      </div>
+                    )}
 
                     <div className="space-y-4">
                       <div className="flex items-center justify-between">
