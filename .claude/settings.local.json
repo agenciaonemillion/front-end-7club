@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__claude_ai_Supabase_MCP__list_tables",
+      "mcp__claude_ai_Supabase_MCP__execute_sql",
+      "Bash(npx next build:*)",
+      "Bash(git stash:*)",
+      "Bash(netstat:*)",
+      "Bash(findstr:*)",
+      "Bash(npx next dev)"
+    ]
+  }
+}

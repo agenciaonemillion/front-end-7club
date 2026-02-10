@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
+import { Badge } from "@/components/ui/badge";
 import { useDropzone, FileRejection } from "react-dropzone";
 import {
   Card,
@@ -38,11 +39,20 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  Sheet,
+  SheetContent,
+  SheetHeader,
+  SheetTitle,
+  SheetDescription,
+} from "@/components/ui/sheet";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Skeleton } from "@/components/ui/skeleton";
 import { useToast } from "@/hooks/use-toast";
+import { supabaseGet, supabasePatch, supabaseDelete } from "@/lib/supabase";
 import {
   RotateCcw,
   Plus,
-  Trash2,
   Copy,
   Check,
   Upload,
@@ -57,8 +67,13 @@ import {
   FileText,
   File,
   AlertCircle,
-  Eye,
   X,
+  Link2,
+  Download,
+  Trash2,
+  RefreshCw,
+  Search,
+  Pencil,
 } from "lucide-react";
 
 const STORAGE_KEY = "agent-config-state";
@@ -80,19 +95,54 @@ interface UploadedFile {
   mime_type: string;
 }
 
-interface KnowledgeBaseFile {
-  file_id: string;
-  filename: string;
-  uploaded_at: string;
-  size_bytes: number;
-  vector_store_id: string;
+
+
+interface AgentListItem {
+  id: string;
+  name: string;
+  model: string;
+  active: boolean;
+  created_at: string;
 }
 
-interface KnowledgeBaseConfig {
-  files: KnowledgeBaseFile[];
+interface AgentFullRecord {
+  id: string;
+  name: string;
+  description: string | null;
+  model: string;
+  instructions: string;
+  active: boolean;
+  temperature: string | null;
+  top_p: string | null;
+  max_output_tokens: number | null;
+  tool_choice: string | null;
+  parallel_tool_calls: boolean;
+  metadata: Record<string, string> | null;
+  reasoning_config: Record<string, string> | null;
+  openai_api_key: string | null;
+  kommo_account_id: string | null;
+  kommo_subdomain: string | null;
+  created_at: string;
+  updated_at: string;
+  agent_vector_stores: Array<{
+    vector_store_id: string;
+    vector_stores: {
+      id: string;
+      name: string | null;
+      openai_vector_store_id: string;
+      total_files: number;
+      total_size_bytes: number;
+    };
+  }>;
+}
+
+interface VectorStoreListItem {
+  id: string;
+  name: string | null;
+  openai_vector_store_id: string;
   total_files: number;
   total_size_bytes: number;
-  last_updated: string;
+  created_at: string;
 }
 
 interface AgentConfigState {
@@ -119,8 +169,7 @@ interface AgentConfigState {
   kommoSubdomain: string;
   metadata: MetadataEntry[];
   // Knowledge Base
-  vectorStoreIds: string[] | null;
-  knowledgeBaseConfig: KnowledgeBaseConfig | null;
+  vectorStoreName: string;
   // Agent UUID (set after creation)
   agentId: string;
 }
@@ -137,15 +186,14 @@ const defaultState: AgentConfigState = {
   temperature: 0.7,
   topP: 1.0,
   reasoningEffort: "medium",
-  maxOutputTokens: "",
-  webhookUrl: "",
+  maxOutputTokens: "8000",
+  webhookUrl: "https://automacao.7club.com.br/webhook/agente-config-webhook",
   vectorStoreWebhookUrl: "https://automacao.7club.com.br/webhook/vector-store-upload",
   openaiApiKey: "",
   kommoAccountId: "",
   kommoSubdomain: "",
   metadata: [],
-  vectorStoreIds: null,
-  knowledgeBaseConfig: null,
+  vectorStoreName: "",
   agentId: "",
 };
 
@@ -262,7 +310,49 @@ export function AgentConfig() {
   // Knowledge Base state
   const [uploadQueue, setUploadQueue] = useState<UploadedFile[]>([]);
   const [isUploadingToVectorStore, setIsUploadingToVectorStore] = useState(false);
-  const { toast } = useToast(); // Use the toast function from useToast hook
+  // Histórico local de vector stores criadas/ações (só desta sessão)
+  const [vectorStoreHistory, setVectorStoreHistory] = useState<Array<{
+    vector_store_id: string;
+    openai_vector_store_id?: string;
+    name?: string;
+    files_processed?: number;
+    total_size_bytes?: number;
+    agent_linked?: boolean;
+    created_at: string;
+  }>>([])
+  // Inputs manuais para assign/unassign
+  const [assignVectorStoreId, setAssignVectorStoreId] = useState("");
+  const [isAssigning, setIsAssigning] = useState(false);
+
+  // Seletor de agentes existentes
+  const [agentListOpen, setAgentListOpen] = useState(false);
+  const [agentList, setAgentList] = useState<AgentListItem[]>([]);
+  const [isLoadingAgentList, setIsLoadingAgentList] = useState(false);
+  const [isLoadingAgent, setIsLoadingAgent] = useState(false);
+
+  // Vector stores vinculadas (do DB real)
+  const [linkedVectorStores, setLinkedVectorStores] = useState<Array<{
+    id: string;
+    name: string;
+    openai_vector_store_id: string;
+    total_files: number;
+    total_size_bytes: number;
+  }>>([]);
+
+  // Dialog de vector stores disponíveis para vincular
+  const [vsListOpen, setVsListOpen] = useState(false);
+  const [availableVectorStores, setAvailableVectorStores] = useState<VectorStoreListItem[]>([]);
+  const [isLoadingVsList, setIsLoadingVsList] = useState(false);
+
+  // Deletar agente
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+
+  // Edição inline de nome de VS
+  const [editingVsId, setEditingVsId] = useState<string | null>(null);
+  const [editingVsName, setEditingVsName] = useState("");
+
+  const { toast } = useToast();
 
   // Load from localStorage on mount
   useEffect(() => {
@@ -359,6 +449,263 @@ export function AgentConfig() {
     []
   );
 
+
+  // ============ Supabase Functions ============
+
+  const fetchLinkedVectorStores = useCallback(async (agentId?: string) => {
+    const id = agentId || state.agentId;
+    if (!id) return;
+    try {
+      const results = await supabaseGet<Array<{
+        agent_vector_stores: Array<{
+          vector_store_id: string;
+          vector_stores: {
+            id: string;
+            name: string | null;
+            openai_vector_store_id: string;
+            total_files: number;
+            total_size_bytes: number;
+          };
+        }>;
+      }>>(`/agent_configs?id=eq.${id}&select=agent_vector_stores(vector_store_id,vector_stores(id,name,openai_vector_store_id,total_files,total_size_bytes))`);
+      if (results.length > 0) {
+        const linked = results[0].agent_vector_stores
+          .map((avs) => avs.vector_stores)
+          .filter(Boolean)
+          .map((vs) => ({
+            id: vs.id,
+            name: vs.name || "Sem nome",
+            openai_vector_store_id: vs.openai_vector_store_id,
+            total_files: vs.total_files || 0,
+            total_size_bytes: vs.total_size_bytes || 0,
+          }));
+        setLinkedVectorStores(linked);
+      }
+    } catch (error) {
+      toast({
+        title: "Erro ao buscar vector stores vinculadas",
+        description: error instanceof Error ? error.message : "Erro desconhecido",
+        variant: "destructive",
+      });
+    }
+  }, [state.agentId, toast]);
+
+  const fetchAgentList = useCallback(async () => {
+    setIsLoadingAgentList(true);
+    try {
+      const agents = await supabaseGet<AgentListItem[]>(
+        "/agent_configs?select=id,name,model,active,created_at&order=created_at.desc"
+      );
+      setAgentList(agents);
+      setAgentListOpen(true);
+    } catch (error) {
+      toast({
+        title: "Erro ao buscar agentes",
+        description: error instanceof Error ? error.message : "Erro desconhecido",
+        variant: "destructive",
+      });
+    } finally {
+      setIsLoadingAgentList(false);
+    }
+  }, [toast]);
+
+  const loadAgent = useCallback(async (agentId: string) => {
+    setIsLoadingAgent(true);
+    try {
+      const results = await supabaseGet<AgentFullRecord[]>(
+        `/agent_configs?id=eq.${agentId}&select=*,agent_vector_stores(vector_store_id,vector_stores(id,name,openai_vector_store_id,total_files,total_size_bytes))`
+      );
+      if (results.length === 0) throw new Error("Agente não encontrado");
+      const agent = results[0];
+
+      // Convert metadata object → MetadataEntry array
+      const metadataObj = typeof agent.metadata === "string"
+        ? JSON.parse(agent.metadata)
+        : agent.metadata;
+      const metadataEntries: MetadataEntry[] = metadataObj && typeof metadataObj === "object"
+        ? Object.entries(metadataObj).map(([key, value]) => ({
+          id: crypto.randomUUID(),
+          key,
+          value: String(value),
+        }))
+        : [];
+
+      // Extract reasoning_effort from reasoning_config jsonb
+      const reasoningConfig = typeof agent.reasoning_config === "string"
+        ? JSON.parse(agent.reasoning_config)
+        : agent.reasoning_config;
+      const reasoningEffort = reasoningConfig?.effort || "medium";
+
+      const newState: AgentConfigState = {
+        name: agent.name || "",
+        description: agent.description || "",
+        model: agent.model || "gpt-4o",
+        instructions: agent.instructions || "",
+        active: agent.active ?? true,
+        tools: "", // tools não estão no agent_configs, gerenciados via webhook
+        toolChoice: agent.tool_choice || "auto",
+        parallelToolCalls: agent.parallel_tool_calls ?? true,
+        temperature: agent.temperature ? parseFloat(String(agent.temperature)) : 0.7,
+        topP: agent.top_p ? parseFloat(String(agent.top_p)) : 1.0,
+        reasoningEffort,
+        maxOutputTokens: agent.max_output_tokens ? String(agent.max_output_tokens) : "8000",
+        webhookUrl: state.webhookUrl,
+        vectorStoreWebhookUrl: state.vectorStoreWebhookUrl,
+        openaiApiKey: agent.openai_api_key || "",
+        kommoAccountId: agent.kommo_account_id || "",
+        kommoSubdomain: agent.kommo_subdomain || "",
+        metadata: metadataEntries,
+        vectorStoreName: "",
+        agentId: agent.id,
+      };
+
+      setState(newState);
+
+      // Populate linked vector stores
+      const linked = agent.agent_vector_stores
+        .map((avs) => avs.vector_stores)
+        .filter(Boolean)
+        .map((vs) => ({
+          id: vs.id,
+          name: vs.name || "Sem nome",
+          openai_vector_store_id: vs.openai_vector_store_id,
+          total_files: vs.total_files || 0,
+          total_size_bytes: vs.total_size_bytes || 0,
+        }));
+      setLinkedVectorStores(linked);
+
+      setAgentListOpen(false);
+      toast({ title: `Agente "${agent.name}" carregado com sucesso!` });
+    } catch (error) {
+      toast({
+        title: "Erro ao carregar agente",
+        description: error instanceof Error ? error.message : "Erro desconhecido",
+        variant: "destructive",
+      });
+    } finally {
+      setIsLoadingAgent(false);
+    }
+  }, [state.webhookUrl, state.vectorStoreWebhookUrl, toast]);
+
+  const fetchAvailableVectorStores = useCallback(async () => {
+    setIsLoadingVsList(true);
+    try {
+      const stores = await supabaseGet<VectorStoreListItem[]>(
+        "/vector_stores?select=id,name,openai_vector_store_id,total_files,total_size_bytes,created_at&order=created_at.desc"
+      );
+      setAvailableVectorStores(stores);
+      setVsListOpen(true);
+    } catch (error) {
+      toast({
+        title: "Erro ao buscar vector stores",
+        description: error instanceof Error ? error.message : "Erro desconhecido",
+        variant: "destructive",
+      });
+    } finally {
+      setIsLoadingVsList(false);
+    }
+  }, [toast]);
+
+  const linkVectorStore = useCallback(async (vectorStoreId: string) => {
+    if (!state.agentId) return;
+    setIsAssigning(true);
+    try {
+      const webhookUrl = state.vectorStoreWebhookUrl || "https://automacao.7club.com.br/webhook/vector-store-upload";
+      const res = await fetch(webhookUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "assign_vector_store",
+          agent_id: state.agentId,
+          vector_store_id: vectorStoreId,
+        }),
+      });
+      const result = await res.json();
+      if (result.success) {
+        toast({ title: "Vector store vinculada com sucesso!" });
+        await fetchLinkedVectorStores();
+        setVsListOpen(false);
+      } else {
+        throw new Error(result.error || `Erro ${res.status}`);
+      }
+    } catch (error) {
+      toast({
+        title: "Erro ao vincular",
+        description: error instanceof Error ? error.message : "Erro desconhecido",
+        variant: "destructive",
+      });
+    } finally {
+      setIsAssigning(false);
+    }
+  }, [state.agentId, state.vectorStoreWebhookUrl, fetchLinkedVectorStores, toast]);
+
+  const handleUnlinkVectorStore = useCallback(async (vsId: string) => {
+    if (!state.agentId) return;
+    try {
+      const webhookUrl = state.vectorStoreWebhookUrl || "https://automacao.7club.com.br/webhook/vector-store-upload";
+      const res = await fetch(webhookUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "unassign_vector_store",
+          agent_id: state.agentId,
+          vector_store_id: vsId,
+        }),
+      });
+      const result = await res.json();
+      if (result.success) {
+        toast({ title: "Vector store desvinculada!" });
+        setLinkedVectorStores((prev) => prev.filter((vs) => vs.id !== vsId));
+      } else {
+        throw new Error(result.error || `Erro ${res.status}`);
+      }
+    } catch (error) {
+      toast({
+        title: "Erro ao desvincular",
+        description: error instanceof Error ? error.message : "Erro desconhecido",
+        variant: "destructive",
+      });
+    }
+  }, [state.agentId, state.vectorStoreWebhookUrl, toast]);
+
+  const saveVsName = useCallback(async (vsId: string) => {
+    try {
+      await supabasePatch(`/vector_stores?id=eq.${vsId}`, { name: editingVsName });
+      setLinkedVectorStores((prev) =>
+        prev.map((vs) => (vs.id === vsId ? { ...vs, name: editingVsName } : vs))
+      );
+      setEditingVsId(null);
+      toast({ title: "Nome atualizado!" });
+    } catch (error) {
+      toast({
+        title: "Erro ao atualizar nome",
+        description: error instanceof Error ? error.message : "Erro desconhecido",
+        variant: "destructive",
+      });
+    }
+  }, [editingVsName, toast]);
+
+  const deleteAgent = useCallback(async () => {
+    if (!state.agentId) return;
+    setIsDeleting(true);
+    try {
+      await supabaseDelete(`/agent_configs?id=eq.${state.agentId}`);
+      toast({ title: "Agente deletado com sucesso!" });
+      setState(defaultState);
+      localStorage.removeItem(STORAGE_KEY);
+      setLinkedVectorStores([]);
+      setDeleteDialogOpen(false);
+    } catch (error) {
+      toast({
+        title: "Erro ao deletar agente",
+        description: error instanceof Error ? error.message : "Erro desconhecido",
+        variant: "destructive",
+      });
+    } finally {
+      setIsDeleting(false);
+    }
+  }, [state.agentId, toast]);
+
   // ============ Knowledge Base Functions ============
 
   // Format file size for display
@@ -413,7 +760,7 @@ export function AgentConfig() {
   // Handle file drop
   const handleFileDrop = useCallback(
     async (acceptedFiles: File[]) => {
-      const existingCount = uploadQueue.length + (state.knowledgeBaseConfig?.total_files || 0);
+      const existingCount = uploadQueue.length;
       if (existingCount + acceptedFiles.length > 20) {
         toast({
           title: "Limite excedido",
@@ -458,7 +805,7 @@ export function AgentConfig() {
         }
       }
     },
-    [uploadQueue.length, state.knowledgeBaseConfig?.total_files, fileToBase64, toast]
+    [uploadQueue.length, fileToBase64, toast]
   );
 
   // Handle rejected files
@@ -502,14 +849,7 @@ export function AgentConfig() {
       return;
     }
 
-    if (!state.agentId) {
-      toast({
-        title: "Agente não criado",
-        description: "Salve a configuração do agente antes de fazer upload de arquivos",
-        variant: "destructive",
-      });
-      return;
-    }
+
 
     if (!state.openaiApiKey) {
       toast({
@@ -522,8 +862,7 @@ export function AgentConfig() {
 
     setIsUploadingToVectorStore(true);
     try {
-      const payload = {
-        agent_id: state.agentId,
+      const payload: Record<string, unknown> = {
         action: "upload_files",
         openai_api_key: state.openaiApiKey,
         files: filesToUpload.map((f) => ({
@@ -532,6 +871,13 @@ export function AgentConfig() {
           mime_type: f.mime_type,
         })),
       };
+      // Campos opcionais
+      if (state.agentId) {
+        payload.agent_id = state.agentId;
+      }
+      if (state.vectorStoreName.trim()) {
+        payload.name = state.vectorStoreName.trim();
+      }
 
       const webhookUrl = state.vectorStoreWebhookUrl || "https://automacao.7club.com.br/webhook/vector-store-upload";
       const response = await fetch(
@@ -550,23 +896,18 @@ export function AgentConfig() {
 
       const result = await response.json();
 
-      // Update state with vector store info
-      if (result.vector_store_id) {
-        updateState({
-          vectorStoreIds: [result.vector_store_id],
-          knowledgeBaseConfig: {
-            files: filesToUpload.map((f) => ({
-              file_id: crypto.randomUUID(),
-              filename: f.filename,
-              uploaded_at: new Date().toISOString(),
-              size_bytes: f.size,
-              vector_store_id: result.vector_store_id,
-            })),
-            total_files: result.files_processed || filesToUpload.length,
-            total_size_bytes: result.total_size_bytes || filesToUpload.reduce((acc, f) => acc + f.size, 0),
-            last_updated: new Date().toISOString(),
-          },
-        });
+      if (result.success) {
+        // Adicionar ao histórico local
+        setVectorStoreHistory(prev => [{
+          vector_store_id: result.vector_store_id,
+          openai_vector_store_id: result.openai_vector_store_id,
+          name: state.vectorStoreName || undefined,
+          files_processed: result.files_processed,
+          total_size_bytes: result.total_size_bytes,
+          agent_linked: result.agent_linked,
+          created_at: new Date().toISOString(),
+        }, ...prev]);
+        updateState({ vectorStoreName: "" });
       }
 
       setUploadQueue([]);
@@ -574,6 +915,10 @@ export function AgentConfig() {
         title: "Upload concluído!",
         description: `${filesToUpload.length} arquivo(s) adicionado(s) à knowledge base`,
       });
+      // Refresh linked vector stores if agent is loaded
+      if (state.agentId) {
+        await fetchLinkedVectorStores();
+      }
     } catch (error) {
       toast({
         title: "Erro no upload",
@@ -583,7 +928,83 @@ export function AgentConfig() {
     } finally {
       setIsUploadingToVectorStore(false);
     }
-  }, [uploadQueue, state.agentId, state.openaiApiKey, state.vectorStoreWebhookUrl, updateState, toast]);
+  }, [uploadQueue, state.agentId, state.openaiApiKey, state.vectorStoreWebhookUrl, state.vectorStoreName, updateState, fetchLinkedVectorStores, toast]);
+
+  // Vincular vector store existente ao agente via webhook
+  const assignVectorStore = useCallback(async () => {
+    if (!state.agentId) {
+      toast({ title: "Preencha o Agent UUID primeiro", variant: "destructive" });
+      return;
+    }
+    if (!assignVectorStoreId.trim()) {
+      toast({ title: "Preencha o Vector Store ID", variant: "destructive" });
+      return;
+    }
+    setIsAssigning(true);
+    try {
+      const webhookUrl = state.vectorStoreWebhookUrl || "https://automacao.7club.com.br/webhook/vector-store-upload";
+      const res = await fetch(webhookUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "assign_vector_store",
+          agent_id: state.agentId,
+          vector_store_id: assignVectorStoreId.trim(),
+        }),
+      });
+      const result = await res.json();
+      if (result.success) {
+        toast({ title: "Vector store vinculada com sucesso!" });
+        setAssignVectorStoreId("");
+        await fetchLinkedVectorStores();
+      } else {
+        throw new Error(result.error || `Erro ${res.status}`);
+      }
+    } catch (error) {
+      toast({
+        title: "Erro ao vincular",
+        description: error instanceof Error ? error.message : "Erro desconhecido",
+        variant: "destructive",
+      });
+    } finally {
+      setIsAssigning(false);
+    }
+  }, [state.agentId, state.vectorStoreWebhookUrl, assignVectorStoreId, fetchLinkedVectorStores, toast]);
+
+  // Desvincular vector store do agente via webhook
+  const unassignVectorStore = useCallback(async (vectorStoreId: string) => {
+    if (!state.agentId) return;
+    try {
+      const webhookUrl = state.vectorStoreWebhookUrl || "https://automacao.7club.com.br/webhook/vector-store-upload";
+      const res = await fetch(webhookUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "unassign_vector_store",
+          agent_id: state.agentId,
+          vector_store_id: vectorStoreId,
+        }),
+      });
+      const result = await res.json();
+      if (result.success) {
+        toast({ title: "Vector store desvinculada" });
+        // Remover do histórico local se estava lá
+        setVectorStoreHistory(prev => prev.map(vs =>
+          vs.vector_store_id === vectorStoreId ? { ...vs, agent_linked: false } : vs
+        ));
+        // Remover das VS vinculadas (DB)
+        setLinkedVectorStores(prev => prev.filter(vs => vs.id !== vectorStoreId));
+      } else {
+        throw new Error(result.error || `Erro ${res.status}`);
+      }
+    } catch (error) {
+      toast({
+        title: "Erro ao desvincular",
+        description: error instanceof Error ? error.message : "Erro desconhecido",
+        variant: "destructive",
+      });
+    }
+  }, [state.agentId, state.vectorStoreWebhookUrl, toast]);
 
   // Dropzone configuration
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
@@ -599,7 +1020,7 @@ export function AgentConfig() {
     onDropRejected: handleDropRejected,
   });
 
-  const isReasoningModel = state.model.startsWith("o1") || state.model.startsWith("o3");
+  const isReasoningModel = state.model.startsWith("o1") || state.model.startsWith("o3") || state.model.startsWith("o4") || state.model.includes("thinking") || state.model.startsWith("gpt-5");
 
   const buildPayload = useCallback(() => {
     let toolsArray: unknown[] = [];
@@ -618,16 +1039,20 @@ export function AgentConfig() {
       }
     }
 
+    const isUpdate = !!state.agentId;
+
     const rawPayload = {
-      action: "create_agent",
+      action: isUpdate ? "update_agent" : "create_agent",
+      ...(isUpdate ? { agent_id: state.agentId } : {}),
       agent: {
         name: state.name,
         description: state.description,
         model: state.model,
         instructions: state.instructions,
         active: state.active,
-        temperature: state.temperature,
-        top_p: state.topP,
+        is_reasoning: isReasoningModel,
+        temperature: !isReasoningModel ? state.temperature : undefined,
+        top_p: !isReasoningModel ? state.topP : undefined,
         tools: toolsArray,
         tool_choice: state.toolChoice,
         parallel_tool_calls: state.parallelToolCalls,
@@ -736,15 +1161,22 @@ export function AgentConfig() {
 
       if (res.ok) {
         // Extract agent_id UUID from response if available
+        let newAgentId: string | null = null;
         try {
           const parsed = JSON.parse(responseBody);
           if (parsed.agent_id) {
+            newAgentId = parsed.agent_id;
             updateState({ agentId: parsed.agent_id });
           }
         } catch {
           // Response wasn't JSON, skip UUID extraction
         }
-        toast({ title: `Agent saved successfully (${res.status})` });
+        const actionLabel = state.agentId ? "updated" : "created";
+        toast({ title: `Agent ${actionLabel} successfully (${res.status})` });
+        // Refresh linked VS after creation/update
+        if (newAgentId || state.agentId) {
+          fetchLinkedVectorStores(newAgentId || state.agentId);
+        }
       } else {
         toast({ title: `Failed to save: ${res.status} ${res.statusText}`, variant: "destructive" });
       }
@@ -816,6 +1248,75 @@ export function AgentConfig() {
           </div>
         </div>
 
+        {/* Agent Selector */}
+        <div className="flex items-center gap-3 mb-6">
+          <Button
+            variant="outline"
+            onClick={fetchAgentList}
+            disabled={isLoadingAgentList}
+            className="bg-transparent"
+          >
+            {isLoadingAgentList ? (
+              <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+            ) : (
+              <Download className="h-4 w-4 mr-2" />
+            )}
+            Carregar Agente Existente
+          </Button>
+          {state.agentId && (
+            <p className="text-sm text-muted-foreground">
+              Editando: <span className="font-medium text-foreground">{state.name}</span>
+              <span className="font-mono ml-1 text-xs">({state.agentId.slice(0, 8)}...)</span>
+            </p>
+          )}
+        </div>
+
+        <Sheet open={agentListOpen} onOpenChange={setAgentListOpen}>
+          <SheetContent side="right" className="w-[400px] sm:max-w-[400px]">
+            <SheetHeader>
+              <SheetTitle>Agentes Existentes</SheetTitle>
+              <SheetDescription>Selecione um agente para carregar no formulário</SheetDescription>
+            </SheetHeader>
+            <ScrollArea className="h-[calc(100vh-120px)] mt-4 pr-3">
+              {isLoadingAgentList ? (
+                <div className="space-y-3">
+                  {[1, 2, 3].map((i) => (
+                    <div key={i} className="p-4 rounded-lg border space-y-2">
+                      <Skeleton className="h-4 w-3/4" />
+                      <Skeleton className="h-3 w-1/2" />
+                    </div>
+                  ))}
+                </div>
+              ) : agentList.length === 0 ? (
+                <p className="text-sm text-muted-foreground text-center py-8">
+                  Nenhum agente encontrado
+                </p>
+              ) : (
+                <div className="space-y-2">
+                  {agentList.map((agent) => (
+                    <button
+                      key={agent.id}
+                      onClick={() => loadAgent(agent.id)}
+                      disabled={isLoadingAgent}
+                      className="w-full text-left p-4 rounded-lg border hover:bg-accent transition-colors disabled:opacity-50"
+                    >
+                      <div className="flex items-center justify-between mb-1">
+                        <p className="font-medium text-sm">{agent.name}</p>
+                        <Badge variant={agent.active ? "default" : "secondary"} className="text-xs">
+                          {agent.active ? "Ativo" : "Inativo"}
+                        </Badge>
+                      </div>
+                      <p className="text-xs text-muted-foreground">
+                        {agent.model} &bull; {formatDate(agent.created_at)}
+                      </p>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </ScrollArea>
+          </SheetContent>
+        </Sheet>
+
         {/* Main Grid */}
         <div className="grid grid-cols-1 lg:grid-cols-[1fr_400px] gap-6">
           {/* Left Column - Form */}
@@ -868,10 +1369,16 @@ export function AgentConfig() {
                             <SelectValue />
                           </SelectTrigger>
                           <SelectContent>
+                            <SelectItem value="gpt-5.2-pro">gpt-5.2-pro (Reasoning)</SelectItem>
+                            <SelectItem value="gpt-5.2-thinking">gpt-5.2-thinking (Reasoning)</SelectItem>
+                            <SelectItem value="gpt-5.2-instant">gpt-5.2-instant</SelectItem>
+                            <SelectItem value="gpt-5.1-thinking">gpt-5.1-thinking (Reasoning)</SelectItem>
+                            <SelectItem value="gpt-5.1-instant">gpt-5.1-instant</SelectItem>
                             <SelectItem value="gpt-4o">gpt-4o</SelectItem>
                             <SelectItem value="gpt-4o-mini">gpt-4o-mini</SelectItem>
                             <SelectItem value="gpt-4-turbo">gpt-4-turbo</SelectItem>
-                            <SelectItem value="o3-mini">o3-mini</SelectItem>
+                            <SelectItem value="o1">o1 (Reasoning)</SelectItem>
+                            <SelectItem value="o3-mini">o3-mini (Reasoning)</SelectItem>
                           </SelectContent>
                         </Select>
                       </div>
@@ -979,49 +1486,72 @@ export function AgentConfig() {
                 {/* Behavior Tab */}
                 <TabsContent value="behavior" className="space-y-6">
                   <div className="grid gap-6">
-                    <div className="space-y-4">
-                      <div className="flex items-center justify-between">
-                        <Label>Temperature</Label>
-                        <span className="text-sm font-medium tabular-nums">
-                          {state.temperature.toFixed(1)}
-                        </span>
-                      </div>
-                      <Slider
-                        value={[state.temperature]}
-                        onValueChange={([value]) =>
-                          updateState({ temperature: value })
-                        }
-                        min={0}
-                        max={2}
-                        step={0.1}
-                        className="w-full"
-                      />
-                      <p className="text-xs text-muted-foreground">
-                        Lower values make output more deterministic
+                    {/* Model type indicator */}
+                    <div className={`rounded-lg border p-4 ${isReasoningModel ? "border-purple-500/30 bg-purple-500/5" : "border-blue-500/30 bg-blue-500/5"}`}>
+                      <p className="text-sm font-medium">
+                        {isReasoningModel ? (
+                          <>
+                            <span className="mr-2">🧠</span>
+                            Modelo de Reasoning — utiliza <strong>Reasoning Effort</strong> ao invés de Temperature.
+                          </>
+                        ) : (
+                          <>
+                            <span className="mr-2">🎨</span>
+                            Modelo Padrão — suporta <strong>Temperature</strong> e <strong>Top P</strong> para controle de criatividade.
+                          </>
+                        )}
                       </p>
                     </div>
 
-                    <div className="space-y-4">
-                      <div className="flex items-center justify-between">
-                        <Label>Top P</Label>
-                        <span className="text-sm font-medium tabular-nums">
-                          {state.topP.toFixed(1)}
-                        </span>
-                      </div>
-                      <Slider
-                        value={[state.topP]}
-                        onValueChange={([value]) => updateState({ topP: value })}
-                        min={0}
-                        max={1}
-                        step={0.1}
-                        className="w-full"
-                      />
-                      <p className="text-xs text-muted-foreground">
-                        Nucleus sampling threshold
-                      </p>
-                    </div>
+                    {/* Temperature & Top P — only for non-reasoning models */}
+                    {!isReasoningModel && (
+                      <>
+                        <div className="space-y-4">
+                          <div className="flex items-center justify-between">
+                            <Label>Temperature</Label>
+                            <span className="text-sm font-medium tabular-nums">
+                              {state.temperature.toFixed(1)}
+                            </span>
+                          </div>
+                          <Slider
+                            value={[state.temperature]}
+                            onValueChange={([value]) =>
+                              updateState({ temperature: value })
+                            }
+                            min={0}
+                            max={2}
+                            step={0.1}
+                            className="w-full"
+                          />
+                          <p className="text-xs text-muted-foreground">
+                            Lower values make output more deterministic
+                          </p>
+                        </div>
 
-                    <div className="grid sm:grid-cols-2 gap-4">
+                        <div className="space-y-4">
+                          <div className="flex items-center justify-between">
+                            <Label>Top P</Label>
+                            <span className="text-sm font-medium tabular-nums">
+                              {state.topP.toFixed(1)}
+                            </span>
+                          </div>
+                          <Slider
+                            value={[state.topP]}
+                            onValueChange={([value]) => updateState({ topP: value })}
+                            min={0}
+                            max={1}
+                            step={0.1}
+                            className="w-full"
+                          />
+                          <p className="text-xs text-muted-foreground">
+                            Nucleus sampling threshold
+                          </p>
+                        </div>
+                      </>
+                    )}
+
+                    {/* Reasoning Effort — only for reasoning models */}
+                    {isReasoningModel && (
                       <div className="space-y-2">
                         <Label htmlFor="reasoningEffort">Reasoning Effort</Label>
                         <Select
@@ -1029,12 +1559,8 @@ export function AgentConfig() {
                           onValueChange={(value) =>
                             updateState({ reasoningEffort: value })
                           }
-                          disabled={!isReasoningModel}
                         >
-                          <SelectTrigger
-                            id="reasoningEffort"
-                            className={!isReasoningModel ? "opacity-50" : ""}
-                          >
+                          <SelectTrigger id="reasoningEffort">
                             <SelectValue />
                           </SelectTrigger>
                           <SelectContent>
@@ -1043,25 +1569,27 @@ export function AgentConfig() {
                             <SelectItem value="high">high</SelectItem>
                           </SelectContent>
                         </Select>
-                        {!isReasoningModel && (
-                          <p className="text-xs text-muted-foreground">
-                            Only available for o1/o3 models
-                          </p>
-                        )}
+                        <p className="text-xs text-muted-foreground">
+                          Controla o esforço de raciocínio do modelo (low, medium, high)
+                        </p>
                       </div>
+                    )}
 
-                      <div className="space-y-2">
-                        <Label htmlFor="maxOutputTokens">Max Output Tokens</Label>
-                        <Input
-                          id="maxOutputTokens"
-                          type="number"
-                          placeholder="e.g., 4096"
-                          value={state.maxOutputTokens}
-                          onChange={(e) =>
-                            updateState({ maxOutputTokens: e.target.value })
-                          }
-                        />
-                      </div>
+                    {/* Max Output Tokens — always visible */}
+                    <div className="space-y-2">
+                      <Label htmlFor="maxOutputTokens">Max Output Tokens</Label>
+                      <Input
+                        id="maxOutputTokens"
+                        type="number"
+                        placeholder="8000"
+                        value={state.maxOutputTokens}
+                        onChange={(e) =>
+                          updateState({ maxOutputTokens: e.target.value })
+                        }
+                      />
+                      <p className="text-xs text-muted-foreground">
+                        Número máximo de tokens na resposta (padrão: 8000)
+                      </p>
                     </div>
                   </div>
                 </TabsContent>
@@ -1073,7 +1601,7 @@ export function AgentConfig() {
                       <Label htmlFor="webhookUrl">Save Configuration URL</Label>
                       <Input
                         id="webhookUrl"
-                        placeholder="https://your-webhook.example.com/agents"
+                        placeholder="https://automacao.7club.com.br/webhook/agente-config-webhook"
                         value={state.webhookUrl}
                         onChange={(e) =>
                           updateState({ webhookUrl: e.target.value })
@@ -1157,67 +1685,6 @@ export function AgentConfig() {
                         </p>
                       </div>
                     </div>
-
-                    <div className="space-y-4">
-                      <div className="flex items-center justify-between">
-                        <Label>Metadata</Label>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={addMetadata}
-                        >
-                          <Plus className="h-4 w-4 mr-1" />
-                          Add Metadata
-                        </Button>
-                      </div>
-
-                      {state.metadata.length === 0 ? (
-                        <div className="rounded-lg border border-dashed p-6 text-center">
-                          <p className="text-sm text-muted-foreground">
-                            No metadata entries. Click "Add Metadata" to add
-                            key-value pairs.
-                          </p>
-                        </div>
-                      ) : (
-                        <div className="space-y-3">
-                          {state.metadata.map((entry) => (
-                            <div
-                              key={entry.id}
-                              className="flex items-center gap-2"
-                            >
-                              <Input
-                                placeholder="Key"
-                                value={entry.key}
-                                onChange={(e) =>
-                                  updateMetadata(entry.id, "key", e.target.value)
-                                }
-                                className="flex-1"
-                              />
-                              <Input
-                                placeholder="Value"
-                                value={entry.value}
-                                onChange={(e) =>
-                                  updateMetadata(
-                                    entry.id,
-                                    "value",
-                                    e.target.value
-                                  )
-                                }
-                                className="flex-1"
-                              />
-                              <Button
-                                variant="ghost"
-                                size="icon"
-                                onClick={() => removeMetadata(entry.id)}
-                                className="text-muted-foreground hover:text-destructive shrink-0"
-                              >
-                                <Trash2 className="h-4 w-4" />
-                              </Button>
-                            </div>
-                          ))}
-                        </div>
-                      )}
-                    </div>
                   </div>
                 </TabsContent>
 
@@ -1233,8 +1700,8 @@ export function AgentConfig() {
                     <div
                       {...getRootProps()}
                       className={`border-2 border-dashed rounded-lg p-12 text-center cursor-pointer transition-colors ${isDragActive
-                          ? "border-primary bg-primary/5"
-                          : "border-muted-foreground/25 hover:border-primary/50"
+                        ? "border-primary bg-primary/5"
+                        : "border-muted-foreground/25 hover:border-primary/50"
                         }`}
                     >
                       <input {...getInputProps()} />
@@ -1290,123 +1757,304 @@ export function AgentConfig() {
                       </div>
                     )}
 
+                    {/* Nome da Vector Store (opcional) */}
+                    {uploadQueue.length > 0 && (
+                      <div className="mt-4">
+                        <Label htmlFor="vs-name">Nome da Vector Store (opcional)</Label>
+                        <Input
+                          id="vs-name"
+                          placeholder="Ex: Catálogo de Produtos, FAQ, Manual..."
+                          value={state.vectorStoreName}
+                          onChange={(e) => updateState({ vectorStoreName: e.target.value })}
+                          className="mt-1"
+                        />
+                      </div>
+                    )}
+
                     <Button
                       className="mt-4 w-full"
                       onClick={uploadFilesToVectorStore}
-                      disabled={isUploadingToVectorStore || uploadQueue.length === 0}
+                      disabled={isUploadingToVectorStore || uploadQueue.filter(f => f.status === "completed").length === 0}
                     >
                       {isUploadingToVectorStore ? (
                         <>
                           <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                          Enviando...
+                          Enviando para Vector Store...
                         </>
                       ) : (
                         <>
                           <Upload className="mr-2 h-4 w-4" />
-                          Upload para Vector Store
+                          Enviar para Vector Store ({uploadQueue.filter(f => f.status === "completed").length} arquivo{uploadQueue.filter(f => f.status === "completed").length !== 1 ? "s" : ""})
                         </>
                       )}
                     </Button>
+
+                    {!state.openaiApiKey && uploadQueue.length > 0 && (
+                      <p className="text-sm text-amber-600 mt-2">
+                        Preencha a OpenAI API Key na aba Business antes de enviar.
+                      </p>
+                    )}
+                    {!state.agentId && uploadQueue.length > 0 && state.openaiApiKey && (
+                      <p className="text-sm text-blue-600 mt-2">
+                        Agent UUID não preenchido. A vector store será criada sem vínculo com agente. Você pode vincular depois.
+                      </p>
+                    )}
                   </Card>
 
-                  {/* Current Knowledge Base Section */}
+                  {/* Vincular Vector Store Existente */}
                   <Card className="p-6">
                     <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
-                      <Book className="h-5 w-5" />
-                      Knowledge Base Atual
+                      <Link2 className="h-5 w-5" />
+                      Vincular Vector Store Existente
                     </h3>
+                    <p className="text-sm text-muted-foreground mb-4">
+                      Busque uma vector store existente ou cole o ID manualmente.
+                    </p>
+                    <Button
+                      variant="outline"
+                      className="w-full mb-4"
+                      onClick={fetchAvailableVectorStores}
+                      disabled={isLoadingVsList || !state.agentId}
+                    >
+                      {isLoadingVsList ? (
+                        <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                      ) : (
+                        <Search className="h-4 w-4 mr-2" />
+                      )}
+                      Buscar Vector Stores
+                    </Button>
+                    <div className="flex gap-2">
+                      <Input
+                        placeholder="Cole o vector_store_id aqui (UUID)"
+                        value={assignVectorStoreId}
+                        onChange={(e) => setAssignVectorStoreId(e.target.value)}
+                        className="flex-1 font-mono text-sm"
+                      />
+                      <Button
+                        onClick={assignVectorStore}
+                        disabled={isAssigning || !assignVectorStoreId.trim() || !state.agentId}
+                      >
+                        {isAssigning ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          "Vincular"
+                        )}
+                      </Button>
+                    </div>
+                    {!state.agentId && (
+                      <p className="text-sm text-amber-600 mt-2">
+                        Crie ou carregue um agente primeiro para vincular vector stores.
+                      </p>
+                    )}
+                  </Card>
 
-                    {!state.knowledgeBaseConfig || state.knowledgeBaseConfig.total_files === 0 ? (
-                      <div className="text-center py-12 bg-muted/50 rounded-lg">
-                        <Database className="w-12 h-12 mx-auto text-muted-foreground mb-4" />
-                        <h4 className="text-lg font-medium mb-2">
-                          Nenhum arquivo na knowledge base
-                        </h4>
-                        <p className="text-sm text-muted-foreground">
-                          Faça upload de arquivos para que o agente possa acessá-los
-                        </p>
-                      </div>
-                    ) : (
-                      <>
-                        {/* Statistics */}
-                        <div className="grid grid-cols-3 gap-4 p-4 bg-muted rounded-lg mb-4">
-                          <div>
-                            <p className="text-sm text-muted-foreground">Vector Store ID</p>
-                            <p className="font-mono text-sm truncate">
-                              {state.vectorStoreIds?.[0] || "N/A"}
-                            </p>
-                          </div>
-                          <div>
-                            <p className="text-sm text-muted-foreground">Total de arquivos</p>
-                            <p className="text-2xl font-bold">
-                              {state.knowledgeBaseConfig.total_files}
-                            </p>
-                          </div>
-                          <div>
-                            <p className="text-sm text-muted-foreground">Storage usado</p>
-                            <p className="text-2xl font-bold">
-                              {formatFileSize(state.knowledgeBaseConfig.total_size_bytes)}
-                            </p>
-                          </div>
-                        </div>
-
-                        {/* File List */}
+                  {/* Dialog: Vector Stores Disponíveis */}
+                  <Dialog open={vsListOpen} onOpenChange={setVsListOpen}>
+                    <DialogContent className="max-w-lg max-h-[80vh]">
+                      <DialogHeader>
+                        <DialogTitle>Vector Stores Disponíveis</DialogTitle>
+                        <DialogDescription>
+                          Selecione uma vector store para vincular a este agente
+                        </DialogDescription>
+                      </DialogHeader>
+                      <ScrollArea className="max-h-[60vh] pr-3">
                         <div className="space-y-2">
-                          {state.knowledgeBaseConfig.files.map((file) => (
-                            <div
-                              key={file.file_id}
-                              className="flex items-center justify-between p-4 rounded-lg border"
-                            >
-                              <div className="flex items-center gap-3">
-                                <FileText className="w-8 h-8 text-blue-500" />
-                                <div>
-                                  <p className="font-medium">{file.filename}</p>
-                                  <p className="text-sm text-muted-foreground">
-                                    {formatFileSize(file.size_bytes)} •{" "}
-                                    {formatDate(file.uploaded_at)}
+                          {availableVectorStores
+                            .filter((vs) => !linkedVectorStores.some((l) => l.id === vs.id))
+                            .map((vs) => (
+                              <div
+                                key={vs.id}
+                                className="flex items-center justify-between p-3 rounded-lg border"
+                              >
+                                <div className="min-w-0 flex-1">
+                                  <p className="font-medium text-sm">{vs.name || "Sem nome"}</p>
+                                  <p className="text-xs text-muted-foreground font-mono truncate">
+                                    {vs.openai_vector_store_id}
+                                  </p>
+                                  <p className="text-xs text-muted-foreground">
+                                    {vs.total_files} arquivo(s) &bull;{" "}
+                                    {formatFileSize(vs.total_size_bytes)} &bull;{" "}
+                                    {formatDate(vs.created_at)}
                                   </p>
                                 </div>
-                              </div>
-                              <div className="flex gap-2">
-                                <Button variant="outline" size="sm">
-                                  <Eye className="w-4 h-4 mr-2" />
-                                  Ver
-                                </Button>
                                 <Button
-                                  variant="destructive"
                                   size="sm"
-                                  onClick={() => {
-                                    // Remove file from KB
-                                    const newFiles = state.knowledgeBaseConfig!.files.filter(
-                                      (f) => f.file_id !== file.file_id
-                                    );
-                                    updateState({
-                                      knowledgeBaseConfig: {
-                                        ...state.knowledgeBaseConfig!,
-                                        files: newFiles,
-                                        total_files: newFiles.length,
-                                        total_size_bytes: newFiles.reduce(
-                                          (acc, f) => acc + f.size_bytes,
-                                          0
-                                        ),
-                                      },
-                                    });
-                                    toast({
-                                      title: "Arquivo removido",
-                                      description: `${file.filename} foi removido da knowledge base`,
-                                    });
-                                  }}
+                                  onClick={() => linkVectorStore(vs.id)}
+                                  disabled={isAssigning}
+                                  className="ml-2"
                                 >
-                                  <Trash2 className="w-4 h-4 mr-2" />
-                                  Remover
+                                  {isAssigning ? (
+                                    <Loader2 className="h-4 w-4 animate-spin" />
+                                  ) : (
+                                    "Vincular"
+                                  )}
                                 </Button>
                               </div>
+                            ))}
+                          {availableVectorStores.filter(
+                            (vs) => !linkedVectorStores.some((l) => l.id === vs.id)
+                          ).length === 0 && (
+                            <p className="text-sm text-muted-foreground text-center py-4">
+                              Nenhuma vector store disponível para vincular.
+                            </p>
+                          )}
+                        </div>
+                      </ScrollArea>
+                    </DialogContent>
+                  </Dialog>
+
+                  {/* Vector Stores Vinculadas (do banco) */}
+                  {state.agentId && (
+                    <Card className="p-6">
+                      <div className="flex items-center justify-between mb-4">
+                        <h3 className="text-lg font-semibold flex items-center gap-2">
+                          <Database className="h-5 w-5" />
+                          Vector Stores Vinculadas ({linkedVectorStores.length})
+                        </h3>
+                        <Button variant="outline" size="sm" onClick={() => fetchLinkedVectorStores()}>
+                          <RefreshCw className="h-4 w-4 mr-1" />
+                          Atualizar
+                        </Button>
+                      </div>
+                      {linkedVectorStores.length === 0 ? (
+                        <p className="text-sm text-muted-foreground text-center py-4">
+                          Nenhuma vector store vinculada a este agente.
+                        </p>
+                      ) : (
+                        <div className="space-y-2">
+                          {linkedVectorStores.map((vs) => (
+                            <div
+                              key={vs.id}
+                              className="flex items-center justify-between p-3 rounded-lg border"
+                            >
+                              <div className="min-w-0 flex-1">
+                                <div className="flex items-center gap-2 mb-1">
+                                  {editingVsId === vs.id ? (
+                                    <div className="flex items-center gap-2">
+                                      <Input
+                                        value={editingVsName}
+                                        onChange={(e) => setEditingVsName(e.target.value)}
+                                        className="h-7 text-sm w-48"
+                                        onKeyDown={(e) => {
+                                          if (e.key === "Enter") saveVsName(vs.id);
+                                          if (e.key === "Escape") setEditingVsId(null);
+                                        }}
+                                      />
+                                      <Button
+                                        size="sm"
+                                        variant="ghost"
+                                        className="h-7 px-2"
+                                        onClick={() => saveVsName(vs.id)}
+                                      >
+                                        <Check className="h-3 w-3" />
+                                      </Button>
+                                      <Button
+                                        size="sm"
+                                        variant="ghost"
+                                        className="h-7 px-2"
+                                        onClick={() => setEditingVsId(null)}
+                                      >
+                                        <X className="h-3 w-3" />
+                                      </Button>
+                                    </div>
+                                  ) : (
+                                    <>
+                                      <p className="font-medium text-sm">{vs.name}</p>
+                                      <Button
+                                        size="sm"
+                                        variant="ghost"
+                                        className="h-6 px-1"
+                                        onClick={() => {
+                                          setEditingVsId(vs.id);
+                                          setEditingVsName(vs.name);
+                                        }}
+                                      >
+                                        <Pencil className="h-3 w-3" />
+                                      </Button>
+                                    </>
+                                  )}
+                                </div>
+                                <p className="text-xs text-muted-foreground font-mono truncate">
+                                  {vs.openai_vector_store_id}
+                                </p>
+                                <p className="text-xs text-muted-foreground">
+                                  {vs.total_files} arquivo(s) &bull;{" "}
+                                  {formatFileSize(vs.total_size_bytes)}
+                                </p>
+                              </div>
+                              <Button
+                                variant="destructive"
+                                size="sm"
+                                onClick={() => handleUnlinkVectorStore(vs.id)}
+                                className="ml-2"
+                              >
+                                Desvincular
+                              </Button>
                             </div>
                           ))}
                         </div>
-                      </>
-                    )}
-                  </Card>
+                      )}
+                    </Card>
+                  )}
+
+                  {/* Histórico de Vector Stores */}
+                  {vectorStoreHistory.length > 0 && (
+                    <Card className="p-6">
+                      <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
+                        <Book className="h-5 w-5" />
+                        Vector Stores Criadas (sessão atual)
+                      </h3>
+                      <div className="space-y-2">
+                        {vectorStoreHistory.map((vs, idx) => (
+                          <div key={vs.vector_store_id + idx} className="flex items-center justify-between p-3 rounded-lg border">
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-2 mb-1">
+                                <p className="font-medium text-sm">{vs.name || "Sem nome"}</p>
+                                {vs.agent_linked && (
+                                  <Badge variant="default" className="text-xs">Vinculada</Badge>
+                                )}
+                                {vs.agent_linked === false && (
+                                  <Badge variant="secondary" className="text-xs">Não vinculada</Badge>
+                                )}
+                              </div>
+                              <p className="text-xs text-muted-foreground font-mono truncate">
+                                ID: {vs.vector_store_id}
+                              </p>
+                              {vs.openai_vector_store_id && (
+                                <p className="text-xs text-muted-foreground font-mono truncate">
+                                  OpenAI: {vs.openai_vector_store_id}
+                                </p>
+                              )}
+                              <p className="text-xs text-muted-foreground">
+                                {vs.files_processed} arquivo(s) • {vs.total_size_bytes ? formatFileSize(vs.total_size_bytes) : "N/A"}
+                              </p>
+                            </div>
+                            <div className="flex gap-2 ml-2">
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={() => {
+                                  navigator.clipboard.writeText(vs.vector_store_id);
+                                  toast({ title: "ID copiado!" });
+                                }}
+                              >
+                                Copiar ID
+                              </Button>
+                              {vs.agent_linked && state.agentId && (
+                                <Button
+                                  variant="destructive"
+                                  size="sm"
+                                  onClick={() => unassignVectorStore(vs.vector_store_id)}
+                                >
+                                  Desvincular
+                                </Button>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </Card>
+                  )}
                 </TabsContent>
               </Tabs>
             </CardContent>
@@ -1488,15 +2136,57 @@ export function AgentConfig() {
                   {isLoading ? (
                     <>
                       <Loader2 className="h-4 w-4 mr-2 animate-spin" />
-                      Saving...
+                      {state.agentId ? "Updating..." : "Creating..."}
                     </>
                   ) : (
                     <>
                       <Save className="h-4 w-4 mr-2" />
-                      Save Agent Configuration
+                      {state.agentId ? "Update Agent" : "Create Agent"}
                     </>
                   )}
                 </Button>
+                {state.agentId && (
+                  <p className="text-xs text-center text-muted-foreground mt-1">
+                    Modo atualização — Agent ID: <span className="font-mono">{state.agentId.slice(0, 8)}...</span>
+                  </p>
+                )}
+                {state.agentId && (
+                  <Dialog open={deleteDialogOpen} onOpenChange={setDeleteDialogOpen}>
+                    <DialogTrigger asChild>
+                      <Button variant="destructive" className="w-full mt-2" size="sm">
+                        <Trash2 className="h-4 w-4 mr-2" />
+                        Deletar Agente
+                      </Button>
+                    </DialogTrigger>
+                    <DialogContent>
+                      <DialogHeader>
+                        <DialogTitle>Confirmar exclusão</DialogTitle>
+                        <DialogDescription>
+                          Tem certeza que deseja deletar o agente &quot;{state.name}&quot;?
+                          Esta ação não pode ser desfeita. As vector stores vinculadas serão
+                          desvinculadas mas NÃO deletadas.
+                        </DialogDescription>
+                      </DialogHeader>
+                      <DialogFooter>
+                        <Button variant="outline" onClick={() => setDeleteDialogOpen(false)}>
+                          Cancelar
+                        </Button>
+                        <Button
+                          variant="destructive"
+                          onClick={deleteAgent}
+                          disabled={isDeleting}
+                        >
+                          {isDeleting ? (
+                            <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                          ) : (
+                            <Trash2 className="h-4 w-4 mr-2" />
+                          )}
+                          Deletar Permanentemente
+                        </Button>
+                      </DialogFooter>
+                    </DialogContent>
+                  </Dialog>
+                )}
               </CardContent>
             </Card>
 
@@ -1530,6 +2220,6 @@ export function AgentConfig() {
           </div>
         </div>
       </div>
-    </div>
+    </div >
   );
 }
