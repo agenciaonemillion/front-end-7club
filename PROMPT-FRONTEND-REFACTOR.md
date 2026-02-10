@@ -279,6 +279,146 @@ Isso garante que qualquer modelo gpt-5.x (gpt-5.2-pro, gpt-5.1-thinking, gpt-5.2
 
 ---
 
+## 10. Adicionar Arquivos a Vector Store Existente (PRIORIDADE ALTA)
+
+Permitir que o usuário adicione novos arquivos a uma vector store que já existe, sem criar uma nova VS.
+
+### Novos states necessários (~linha 354, após editingVsName):
+```typescript
+const [addFilesVsId, setAddFilesVsId] = useState<string | null>(null); // ID interno (uuid) — quando não null, abre Dialog
+const [addFilesOpenaiVsId, setAddFilesOpenaiVsId] = useState<string>(""); // OpenAI VS ID (vs_xxx)
+const [addFilesQueue, setAddFilesQueue] = useState<UploadedFile[]>([]); // Fila de arquivos separada
+const [isUploadingAddFiles, setIsUploadingAddFiles] = useState(false); // Loading state
+```
+
+### Novos callbacks (após deleteAgent):
+
+**handleAddFilesDrop(acceptedFiles: File[]):**
+- Mesma lógica de `handleFileDrop` mas popula `addFilesQueue` em vez de `uploadQueue`
+- Limite: 20 arquivos
+- Converte para base64
+
+**removeAddFile(fileId: string):**
+- Remove arquivo de `addFilesQueue`
+
+**addFilesToExistingVectorStore():**
+- Valida: addFilesQueue tem arquivos com status "completed", state.openaiApiKey preenchida
+- POST para o webhook com:
+```json
+{
+  "action": "add_files_to_vector_store",
+  "openai_api_key": "sk-...",
+  "openai_vector_store_id": "vs_xxx...",
+  "vector_store_id": "uuid-interno",
+  "files": [
+    { "filename": "novo.pdf", "content": "base64...", "mime_type": "application/pdf" }
+  ]
+}
+```
+- Endpoint: `state.vectorStoreWebhookUrl` (mesmo webhook das outras actions)
+- Após sucesso: limpar addFilesQueue, fechar Dialog (`setAddFilesVsId(null)`), toast, `fetchLinkedVectorStores()`
+
+### Segundo useDropzone (após o primeiro, ~linha 1021):
+```typescript
+const {
+  getRootProps: getAddFilesRootProps,
+  getInputProps: getAddFilesInputProps,
+  isDragActive: isAddFilesDragActive,
+} = useDropzone({
+  accept: { /* mesmos tipos aceitos */ },
+  maxSize: 50 * 1024 * 1024,
+  maxFiles: 20,
+  onDrop: handleAddFilesDrop,
+  onDropRejected: handleDropRejected, // reutiliza o existente
+});
+```
+
+### Botão "Adicionar Arquivos" no card de Vector Stores Vinculadas:
+Na lista de `linkedVectorStores`, ao lado do botão "Desvincular", adicionar:
+```tsx
+<Button
+  variant="outline"
+  size="sm"
+  onClick={() => {
+    setAddFilesVsId(vs.id);
+    setAddFilesOpenaiVsId(vs.openai_vector_store_id);
+    setAddFilesQueue([]);
+  }}
+>
+  <Upload className="h-3 w-3 mr-1" />
+  Adicionar Arquivos
+</Button>
+```
+
+### Dialog de upload de arquivos:
+```tsx
+<Dialog open={addFilesVsId !== null} onOpenChange={(open) => { if (!open) setAddFilesVsId(null); }}>
+  <DialogContent className="max-w-lg">
+    <DialogHeader>
+      <DialogTitle>Adicionar Arquivos</DialogTitle>
+      <DialogDescription>Adicionando à vector store {addFilesOpenaiVsId}</DialogDescription>
+    </DialogHeader>
+
+    {/* Dropzone */}
+    <div {...getAddFilesRootProps()} className="border-2 border-dashed rounded-lg p-6 text-center cursor-pointer hover:border-primary/50">
+      <input {...getAddFilesInputProps()} />
+      <Upload className="mx-auto h-8 w-8 text-muted-foreground mb-2" />
+      <p className="text-sm">{isAddFilesDragActive ? "Solte os arquivos..." : "Arraste arquivos ou clique para selecionar"}</p>
+      <p className="text-xs text-muted-foreground mt-1">PDF, TXT, DOCX, MD — até 50MB cada</p>
+    </div>
+
+    {/* Lista de arquivos na fila */}
+    {addFilesQueue.length > 0 && (
+      <div className="space-y-2 max-h-48 overflow-y-auto">
+        {addFilesQueue.map((f) => (
+          <div key={f.id} className="flex items-center justify-between p-2 rounded border text-sm">
+            <div className="flex items-center gap-2 min-w-0">
+              {getFileIcon(f.mime_type)}
+              <span className="truncate">{f.filename}</span>
+              <span className="text-xs text-muted-foreground">{formatFileSize(f.size)}</span>
+            </div>
+            <Button variant="ghost" size="sm" onClick={() => removeAddFile(f.id)}>
+              <X className="h-3 w-3" />
+            </Button>
+          </div>
+        ))}
+      </div>
+    )}
+
+    {!state.openaiApiKey && addFilesQueue.length > 0 && (
+      <p className="text-sm text-amber-600">Preencha a OpenAI API Key na aba Business antes de enviar.</p>
+    )}
+
+    <DialogFooter>
+      <Button variant="outline" onClick={() => setAddFilesVsId(null)}>Cancelar</Button>
+      <Button
+        onClick={addFilesToExistingVectorStore}
+        disabled={addFilesQueue.filter(f => f.status === "completed").length === 0 || isUploadingAddFiles || !state.openaiApiKey}
+      >
+        {isUploadingAddFiles ? <><Loader2 className="h-4 w-4 mr-2 animate-spin" />Enviando...</> : <><Upload className="h-4 w-4 mr-2" />Enviar Arquivos</>}
+      </Button>
+    </DialogFooter>
+  </DialogContent>
+</Dialog>
+```
+
+---
+
+## Resumo de prioridades (atualizado)
+
+1. **ALTA** — Helper Supabase REST (item 1)
+2. **ALTA** — Seletor de agente existente + carregamento completo (item 2)
+3. **ALTA** — Exibir vector stores vinculadas do DB real (item 3)
+4. **ALTA** — Edição de agente funcional (item 5)
+5. **ALTA** — Adicionar arquivos a VS existente (item 10)
+6. **MÉDIA** — Lista de vector stores disponíveis para vincular (item 4)
+7. **MÉDIA** — Refresh automático (item 8)
+8. **MÉDIA** — Atualizar isReasoningModel (item 9)
+9. **BAIXA** — Edição de vector store (item 6)
+10. **BAIXA** — Deletar agente (item 7)
+
+---
+
 ## Exemplo de fluxo completo esperado após implementação
 
 1. Usuário abre a página
@@ -293,3 +433,7 @@ Isso garante que qualquer modelo gpt-5.x (gpt-5.2-pro, gpt-5.1-thinking, gpt-5.2
 10. A lista de VS vinculadas atualiza automaticamente mostrando as 3
 11. Desvincula a VS "FAQ" → webhook unassign_vector_store
 12. Lista atualiza mostrando 2 VS vinculadas
+13. Clica "Adicionar Arquivos" na VS "Catálogo de Produtos" → abre Dialog
+14. Arrasta 2 PDFs novos → aparecem na lista do Dialog
+15. Clica "Enviar Arquivos" → webhook add_files_to_vector_store
+16. Toast sucesso, Dialog fecha, total_files da VS atualizado na lista

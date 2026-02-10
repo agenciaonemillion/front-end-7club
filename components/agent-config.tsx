@@ -352,6 +352,12 @@ export function AgentConfig() {
   const [editingVsId, setEditingVsId] = useState<string | null>(null);
   const [editingVsName, setEditingVsName] = useState("");
 
+  // Adicionar arquivos a VS existente
+  const [addFilesVsId, setAddFilesVsId] = useState<string | null>(null);
+  const [addFilesOpenaiVsId, setAddFilesOpenaiVsId] = useState<string>("");
+  const [addFilesQueue, setAddFilesQueue] = useState<UploadedFile[]>([]);
+  const [isUploadingAddFiles, setIsUploadingAddFiles] = useState(false);
+
   const { toast } = useToast();
 
   // Load from localStorage on mount
@@ -757,6 +763,130 @@ export function AgentConfig() {
     });
   }, []);
 
+  // ============ Add Files to Existing VS ============
+
+  const handleAddFilesDrop = useCallback(
+    async (acceptedFiles: File[]) => {
+      const existingCount = addFilesQueue.length;
+      if (existingCount + acceptedFiles.length > 20) {
+        toast({
+          title: "Limite excedido",
+          description: "Máximo de 20 arquivos por vez",
+          variant: "destructive",
+        });
+        return;
+      }
+
+      const newFiles: UploadedFile[] = acceptedFiles.map((file) => ({
+        id: crypto.randomUUID(),
+        filename: file.name,
+        size: file.size,
+        mime_type: file.type || "application/octet-stream",
+        status: "pending" as const,
+        progress: 0,
+      }));
+
+      setAddFilesQueue((prev) => [...prev, ...newFiles]);
+
+      for (let i = 0; i < newFiles.length; i++) {
+        const fileInfo = newFiles[i];
+        const originalFile = acceptedFiles[i];
+        try {
+          const base64Content = await fileToBase64(originalFile);
+          setAddFilesQueue((prev) =>
+            prev.map((f) =>
+              f.id === fileInfo.id
+                ? { ...f, content: base64Content, status: "completed" as const, progress: 100 }
+                : f
+            )
+          );
+        } catch {
+          setAddFilesQueue((prev) =>
+            prev.map((f) =>
+              f.id === fileInfo.id
+                ? { ...f, status: "error" as const, error: "Erro ao processar arquivo" }
+                : f
+            )
+          );
+        }
+      }
+    },
+    [addFilesQueue.length, fileToBase64, toast]
+  );
+
+  const removeAddFile = useCallback((fileId: string) => {
+    setAddFilesQueue((prev) => prev.filter((f) => f.id !== fileId));
+  }, []);
+
+  const addFilesToExistingVectorStore = useCallback(async () => {
+    const filesToUpload = addFilesQueue.filter((f) => f.status === "completed" && f.content);
+    if (filesToUpload.length === 0) {
+      toast({
+        title: "Nenhum arquivo para enviar",
+        description: "Adicione arquivos antes de fazer upload",
+        variant: "destructive",
+      });
+      return;
+    }
+    if (!state.openaiApiKey) {
+      toast({
+        title: "API Key não informada",
+        description: "Informe a OpenAI API Key na aba Business antes de fazer upload",
+        variant: "destructive",
+      });
+      return;
+    }
+    if (!addFilesVsId || !addFilesOpenaiVsId) {
+      toast({ title: "Vector store não selecionada", variant: "destructive" });
+      return;
+    }
+
+    setIsUploadingAddFiles(true);
+    try {
+      const webhookUrl = state.vectorStoreWebhookUrl || "https://automacao.7club.com.br/webhook/vector-store-upload";
+      const res = await fetch(webhookUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "add_files_to_vector_store",
+          openai_api_key: state.openaiApiKey,
+          openai_vector_store_id: addFilesOpenaiVsId,
+          vector_store_id: addFilesVsId,
+          files: filesToUpload.map((f) => ({
+            filename: f.filename,
+            content: f.content,
+            mime_type: f.mime_type,
+          })),
+        }),
+      });
+
+      const result = await res.json();
+      if (result.success) {
+        toast({
+          title: "Arquivos adicionados!",
+          description: `${result.files_added} arquivo(s) adicionado(s) à vector store`,
+        });
+        setAddFilesQueue([]);
+        setAddFilesVsId(null);
+        setAddFilesOpenaiVsId("");
+        // Refresh linked VS
+        if (state.agentId) {
+          fetchLinkedVectorStores(state.agentId);
+        }
+      } else {
+        throw new Error(result.error || `Erro ${res.status}`);
+      }
+    } catch (error) {
+      toast({
+        title: "Erro ao adicionar arquivos",
+        description: error instanceof Error ? error.message : "Erro desconhecido",
+        variant: "destructive",
+      });
+    } finally {
+      setIsUploadingAddFiles(false);
+    }
+  }, [addFilesQueue, state.openaiApiKey, state.vectorStoreWebhookUrl, addFilesVsId, addFilesOpenaiVsId, state.agentId, fetchLinkedVectorStores, toast]);
+
   // Handle file drop
   const handleFileDrop = useCallback(
     async (acceptedFiles: File[]) => {
@@ -1017,6 +1147,23 @@ export function AgentConfig() {
     maxSize: 50 * 1024 * 1024,
     maxFiles: 20,
     onDrop: handleFileDrop,
+    onDropRejected: handleDropRejected,
+  });
+
+  const {
+    getRootProps: getAddFilesRootProps,
+    getInputProps: getAddFilesInputProps,
+    isDragActive: isAddFilesDragActive,
+  } = useDropzone({
+    accept: {
+      "application/pdf": [".pdf"],
+      "text/plain": [".txt"],
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document": [".docx"],
+      "text/markdown": [".md"],
+    },
+    maxSize: 50 * 1024 * 1024,
+    maxFiles: 20,
+    onDrop: handleAddFilesDrop,
     onDropRejected: handleDropRejected,
   });
 
@@ -1982,20 +2129,114 @@ export function AgentConfig() {
                                   {formatFileSize(vs.total_size_bytes)}
                                 </p>
                               </div>
-                              <Button
-                                variant="destructive"
-                                size="sm"
-                                onClick={() => handleUnlinkVectorStore(vs.id)}
-                                className="ml-2"
-                              >
-                                Desvincular
-                              </Button>
+                              <div className="flex gap-2 ml-2">
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={() => {
+                                    setAddFilesVsId(vs.id);
+                                    setAddFilesOpenaiVsId(vs.openai_vector_store_id);
+                                    setAddFilesQueue([]);
+                                  }}
+                                >
+                                  <Upload className="h-3 w-3 mr-1" />
+                                  Adicionar Arquivos
+                                </Button>
+                                <Button
+                                  variant="destructive"
+                                  size="sm"
+                                  onClick={() => handleUnlinkVectorStore(vs.id)}
+                                >
+                                  Desvincular
+                                </Button>
+                              </div>
                             </div>
                           ))}
                         </div>
                       )}
                     </Card>
                   )}
+
+                  {/* Dialog: Adicionar Arquivos a VS Existente */}
+                  <Dialog open={addFilesVsId !== null} onOpenChange={(open) => { if (!open) { setAddFilesVsId(null); setAddFilesQueue([]); } }}>
+                    <DialogContent className="max-w-lg">
+                      <DialogHeader>
+                        <DialogTitle>Adicionar Arquivos</DialogTitle>
+                        <DialogDescription>
+                          Adicionando à vector store <span className="font-mono">{addFilesOpenaiVsId}</span>
+                        </DialogDescription>
+                      </DialogHeader>
+
+                      <div
+                        {...getAddFilesRootProps()}
+                        className={`border-2 border-dashed rounded-lg p-6 text-center cursor-pointer transition-colors ${
+                          isAddFilesDragActive
+                            ? "border-primary bg-primary/5"
+                            : "border-muted-foreground/25 hover:border-primary/50"
+                        }`}
+                      >
+                        <input {...getAddFilesInputProps()} />
+                        <Upload className="w-8 h-8 mx-auto mb-2 text-muted-foreground" />
+                        <p className="text-sm">
+                          {isAddFilesDragActive
+                            ? "Solte os arquivos aqui..."
+                            : "Arraste arquivos ou clique para selecionar"}
+                        </p>
+                        <p className="text-xs text-muted-foreground mt-1">
+                          PDF, TXT, DOCX, MD — até 50MB cada
+                        </p>
+                      </div>
+
+                      {addFilesQueue.length > 0 && (
+                        <div className="space-y-2 max-h-48 overflow-y-auto">
+                          {addFilesQueue.map((f) => (
+                            <div key={f.id} className="flex items-center justify-between p-2 rounded-lg border text-sm">
+                              <div className="flex items-center gap-2 min-w-0">
+                                {getFileIcon(f.mime_type)}
+                                <span className="truncate">{f.filename}</span>
+                                <span className="text-xs text-muted-foreground">{formatFileSize(f.size)}</span>
+                              </div>
+                              <div className="flex items-center gap-1">
+                                {f.status === "completed" && <Check className="w-4 h-4 text-green-500" />}
+                                {f.status === "error" && <AlertCircle className="w-4 h-4 text-red-500" />}
+                                <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => removeAddFile(f.id)}>
+                                  <X className="h-3 w-3" />
+                                </Button>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {!state.openaiApiKey && addFilesQueue.length > 0 && (
+                        <p className="text-sm text-amber-600">
+                          Preencha a OpenAI API Key na aba Business antes de enviar.
+                        </p>
+                      )}
+
+                      <DialogFooter>
+                        <Button variant="outline" onClick={() => { setAddFilesVsId(null); setAddFilesQueue([]); }}>
+                          Cancelar
+                        </Button>
+                        <Button
+                          onClick={addFilesToExistingVectorStore}
+                          disabled={addFilesQueue.filter((f) => f.status === "completed").length === 0 || isUploadingAddFiles || !state.openaiApiKey}
+                        >
+                          {isUploadingAddFiles ? (
+                            <>
+                              <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+                              Enviando...
+                            </>
+                          ) : (
+                            <>
+                              <Upload className="h-4 w-4 mr-2" />
+                              Enviar {addFilesQueue.filter((f) => f.status === "completed").length} Arquivo(s)
+                            </>
+                          )}
+                        </Button>
+                      </DialogFooter>
+                    </DialogContent>
+                  </Dialog>
 
                   {/* Histórico de Vector Stores */}
                   {vectorStoreHistory.length > 0 && (
