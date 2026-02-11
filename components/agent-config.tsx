@@ -23,6 +23,7 @@ import {
 } from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
 import { Switch } from "@/components/ui/switch";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Dialog,
@@ -77,6 +78,74 @@ import {
 } from "lucide-react";
 
 const STORAGE_KEY = "agent-config-state";
+
+interface PredefinedTool {
+  id: string;
+  name: string;
+  description: string;
+  tool_type: string;
+  parameters: {
+    type: string;
+    properties: Record<string, unknown>;
+    required: string[];
+  };
+  execution_config: {
+    url: string;
+    method: string;
+    headers: Record<string, string>;
+    body: unknown;
+  };
+}
+
+const PREDEFINED_TOOLS: PredefinedTool[] = [
+  {
+    id: "transfer_lead_kommo",
+    name: "Transferir Lead",
+    description: "Transfere o lead para atendimento humano e para a IA no Kommo",
+    tool_type: "function",
+    parameters: {
+      type: "object",
+      properties: {
+        id_lead: {
+          type: "integer",
+          description: "ID do lead no Kommo",
+        },
+        id_campo_transferir: {
+          type: "integer",
+          description: "ID do campo customizado para marcar transferencia",
+        },
+        id_campo_parar_ia: {
+          type: "integer",
+          description: "ID do campo customizado para parar a IA",
+        },
+      },
+      required: ["id_lead", "id_campo_transferir", "id_campo_parar_ia"],
+    },
+    execution_config: {
+      url: "https://{{subdomain}}.kommo.com/api/v4/leads",
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer {{kommo_token}}",
+      },
+      body: [
+        {
+          id: "INT:{{id_lead}}",
+          custom_fields_values: [
+            {
+              field_id: "INT:{{id_campo_transferir}}",
+              values: [{ value: true }],
+            },
+            {
+              field_id: "INT:{{id_campo_parar_ia}}",
+              values: [{ value: true }],
+            },
+          ],
+        },
+      ],
+    },
+  },
+];
 
 interface MetadataEntry {
   id: string;
@@ -153,7 +222,7 @@ interface AgentConfigState {
   instructions: string;
   active: boolean;
   // Capabilities
-  tools: string;
+  selectedTools: string[];
   toolChoice: string;
   parallelToolCalls: boolean;
   // Behavior
@@ -180,7 +249,7 @@ const defaultState: AgentConfigState = {
   model: "gpt-4o",
   instructions: "",
   active: true,
-  tools: "",
+  selectedTools: [],
   toolChoice: "auto",
   parallelToolCalls: true,
   temperature: 0.7,
@@ -204,7 +273,7 @@ const templates: Record<string, Partial<AgentConfigState>> = {
     model: "gpt-4o-mini",
     instructions: "You are a helpful assistant. Be polite, concise, and use emojis in your responses. Your main goal is to greet the user and ask how you can help.",
     temperature: 0.7,
-    tools: "[]",
+    selectedTools: [],
     toolChoice: "auto",
     active: true,
   },
@@ -214,25 +283,7 @@ const templates: Record<string, Partial<AgentConfigState>> = {
     model: "gpt-4o",
     instructions: "You are a customer support agent for 'Acme Online Store'. Your goal is to help users with their orders. Use the available tools to look up order status. Be professional and empathetic. If you cannot resolve an issue, offer to escalate to a human agent.",
     temperature: 0.5,
-    tools: JSON.stringify([
-      {
-        type: "function",
-        function: {
-          name: "get_order_status",
-          description: "Retrieves the current status and details of a customer order.",
-          parameters: {
-            type: "object",
-            properties: {
-              order_id: {
-                type: "string",
-                description: "The unique identifier for the order (e.g., ORD-12345)",
-              },
-            },
-            required: ["order_id"],
-          },
-        },
-      },
-    ], null, 2),
+    selectedTools: ["transfer_lead_kommo"],
     toolChoice: "auto",
     parallelToolCalls: true,
     active: true,
@@ -244,7 +295,7 @@ const templates: Record<string, Partial<AgentConfigState>> = {
     instructions: "You are an expert technical analyst. When presented with a problem, think step-by-step. Break down complex issues into smaller parts. Provide detailed explanations and consider edge cases. Your goal is to provide thorough, well-reasoned technical guidance.",
     temperature: 1,
     reasoningEffort: "high",
-    tools: "[]",
+    selectedTools: [],
     toolChoice: "auto",
     active: true,
   },
@@ -298,7 +349,7 @@ export function AgentConfig() {
   const [state, setState] = useState<AgentConfigState>(defaultState);
   const [isLoading, setIsLoading] = useState(false);
   const [copied, setCopied] = useState(false);
-  const [toolsError, setToolsError] = useState<string | null>(null);
+  // toolsError removed - now using predefined checkboxes
   const [importJson, setImportJson] = useState("");
   const [importDialogOpen, setImportDialogOpen] = useState(false);
   const [isHydrated, setIsHydrated] = useState(false);
@@ -381,23 +432,7 @@ export function AgentConfig() {
     }
   }, [state, isHydrated]);
 
-  // Validate tools JSON
-  useEffect(() => {
-    if (!state.tools.trim()) {
-      setToolsError(null);
-      return;
-    }
-    try {
-      const parsed = JSON.parse(state.tools);
-      if (!Array.isArray(parsed)) {
-        setToolsError("Tools must be an array");
-      } else {
-        setToolsError(null);
-      }
-    } catch {
-      setToolsError("Invalid JSON syntax");
-    }
-  }, [state.tools]);
+  // Tools validation removed - now using predefined checkboxes
 
   const updateState = useCallback(
     (updates: Partial<AgentConfigState>) => {
@@ -496,6 +531,22 @@ export function AgentConfig() {
     }
   }, [state.agentId, toast]);
 
+  const fetchLinkedTools = useCallback(async (agentId?: string) => {
+    const id = agentId || state.agentId;
+    if (!id) return;
+    try {
+      const tools = await supabaseGet<Array<{ tool_name: string }>>(
+        `/agent_tools?agent_id=eq.${id}&select=tool_name`
+      );
+      const toolIds = tools
+        .map((t) => t.tool_name)
+        .filter((name) => PREDEFINED_TOOLS.some((pt) => pt.id === name));
+      updateState({ selectedTools: toolIds });
+    } catch {
+      // Silently fail - tools will just show as unchecked
+    }
+  }, [state.agentId, updateState]);
+
   const fetchAgentList = useCallback(async () => {
     setIsLoadingAgentList(true);
     try {
@@ -548,7 +599,7 @@ export function AgentConfig() {
         model: agent.model || "gpt-4o",
         instructions: agent.instructions || "",
         active: agent.active ?? true,
-        tools: "", // tools não estão no agent_configs, gerenciados via webhook
+        selectedTools: [], // tools carregadas separadamente via fetchLinkedTools
         toolChoice: agent.tool_choice || "auto",
         parallelToolCalls: agent.parallel_tool_calls ?? true,
         temperature: agent.temperature ? parseFloat(String(agent.temperature)) : 0.7,
@@ -579,6 +630,9 @@ export function AgentConfig() {
           total_size_bytes: vs.total_size_bytes || 0,
         }));
       setLinkedVectorStores(linked);
+
+      // Load linked tools from agent_tools table
+      fetchLinkedTools(agentId);
 
       setAgentListOpen(false);
       toast({ title: `Agente "${agent.name}" carregado com sucesso!` });
@@ -1170,14 +1224,19 @@ export function AgentConfig() {
   const isReasoningModel = state.model.startsWith("o1") || state.model.startsWith("o3") || state.model.startsWith("o4") || state.model.includes("thinking") || state.model.startsWith("gpt-5");
 
   const buildPayload = useCallback(() => {
-    let toolsArray: unknown[] = [];
-    if (state.tools.trim()) {
-      try {
-        toolsArray = JSON.parse(state.tools);
-      } catch {
-        toolsArray = [];
-      }
-    }
+    // Build tools from selected predefined tools
+    const selectedToolsData = state.selectedTools
+      .map((id) => PREDEFINED_TOOLS.find((t) => t.id === id))
+      .filter((t): t is PredefinedTool => t !== undefined);
+
+    const toolsArray = selectedToolsData.map((t) => ({
+      type: t.tool_type,
+      function: {
+        name: t.id,
+        description: t.description,
+        parameters: t.parameters,
+      },
+    }));
 
     const metadataObj: Record<string, string> = {};
     for (const entry of state.metadata) {
@@ -1210,6 +1269,14 @@ export function AgentConfig() {
         metadata: metadataObj,
         openai_api_key: state.openaiApiKey,
       },
+      // Tools completas para salvar na agent_tools
+      agent_tools: selectedToolsData.map((t) => ({
+        tool_type: t.tool_type,
+        tool_name: t.id,
+        description: t.description,
+        parameters: t.parameters,
+        execution_config: t.execution_config,
+      })),
       kommo_account_id: state.kommoAccountId,
       kommo_subdomain: state.kommoSubdomain,
     };
@@ -1320,9 +1387,10 @@ export function AgentConfig() {
         }
         const actionLabel = state.agentId ? "updated" : "created";
         toast({ title: `Agent ${actionLabel} successfully (${res.status})` });
-        // Refresh linked VS after creation/update
+        // Refresh linked VS and tools after creation/update
         if (newAgentId || state.agentId) {
           fetchLinkedVectorStores(newAgentId || state.agentId);
+          fetchLinkedTools(newAgentId || state.agentId);
         }
       } else {
         toast({ title: `Failed to save: ${res.status} ${res.statusText}`, variant: "destructive" });
@@ -1577,18 +1645,45 @@ export function AgentConfig() {
                 {/* Capabilities Tab */}
                 <TabsContent value="capabilities" className="space-y-6">
                   <div className="grid gap-6">
-                    <div className="space-y-2">
-                      <Label htmlFor="tools">Tools JSON Schema</Label>
-                      <Textarea
-                        id="tools"
-                        placeholder={'[\n  {\n    "type": "function",\n    "function": { ... }\n  }\n]'}
-                        value={state.tools}
-                        onChange={(e) => updateState({ tools: e.target.value })}
-                        className={`min-h-[200px] resize-y font-mono text-sm ${toolsError ? "border-destructive" : ""
-                          }`}
-                      />
-                      {toolsError && (
-                        <p className="text-sm text-destructive">{toolsError}</p>
+                    <div className="space-y-4">
+                      <Label>Available Tools</Label>
+                      <p className="text-xs text-muted-foreground">
+                        Select the tools you want this agent to have access to.
+                      </p>
+                      {PREDEFINED_TOOLS.map((tool) => (
+                        <div
+                          key={tool.id}
+                          className="flex items-start space-x-3 p-4 border rounded-lg hover:bg-muted/50 transition-colors"
+                        >
+                          <Checkbox
+                            id={`tool-${tool.id}`}
+                            checked={state.selectedTools.includes(tool.id)}
+                            onCheckedChange={(checked) => {
+                              const newTools = checked
+                                ? [...state.selectedTools, tool.id]
+                                : state.selectedTools.filter(
+                                    (id) => id !== tool.id
+                                  );
+                              updateState({ selectedTools: newTools });
+                            }}
+                          />
+                          <div className="space-y-1">
+                            <Label
+                              htmlFor={`tool-${tool.id}`}
+                              className="font-medium cursor-pointer"
+                            >
+                              {tool.name}
+                            </Label>
+                            <p className="text-xs text-muted-foreground">
+                              {tool.description}
+                            </p>
+                          </div>
+                        </div>
+                      ))}
+                      {PREDEFINED_TOOLS.length === 0 && (
+                        <p className="text-sm text-muted-foreground italic">
+                          No tools available yet.
+                        </p>
                       )}
                     </div>
 
