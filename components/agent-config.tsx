@@ -187,7 +187,7 @@ const defaultState: AgentConfigState = {
   topP: 1.0,
   reasoningEffort: "medium",
   maxOutputTokens: "8000",
-  webhookUrl: "https://automacao.7club.com.br/webhook/agente-config-webhook",
+  webhookUrl: "https://automacao.7club.com.br/webhook/agent-config",
   vectorStoreWebhookUrl: "https://automacao.7club.com.br/webhook/vector-store-upload",
   openaiApiKey: "",
   kommoAccountId: "",
@@ -1748,7 +1748,7 @@ export function AgentConfig() {
                       <Label htmlFor="webhookUrl">Save Configuration URL</Label>
                       <Input
                         id="webhookUrl"
-                        placeholder="https://automacao.7club.com.br/webhook/agente-config-webhook"
+                        placeholder="https://automacao.7club.com.br/webhook/agent-config"
                         value={state.webhookUrl}
                         onChange={(e) =>
                           updateState({ webhookUrl: e.target.value })
